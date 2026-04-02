@@ -194,6 +194,9 @@ def load_rft_model(ckpt_path: str, device: torch.device) -> Tuple[RFTLM, dict]:
         use_memory=True,
         mem_top_m=a["mem_top_m"],
         ocr_dim=a["ocr_dim"],
+        ocr_alpha_init=a.get("ocr_alpha_init", 1e-2),
+        ocr_margin=a.get("ocr_margin", 0.10),
+        mem_gate_alpha_init=a.get("mem_gate_alpha_init", 1.0),
     ).to(device)
 
     state_dict = ck["model"]

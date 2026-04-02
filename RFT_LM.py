@@ -125,11 +125,13 @@ class RFTMemoryLayer(nn.Module):
     """
 
     def __init__(self, d_model: int, top_m: int = 64, ocr_dim: int = 256,
-                 ocr_alpha_init: float = 1e-4, n_heads: int = 4):
+                 ocr_alpha_init: float = 1e-2, ocr_margin: float = 0.10,
+                 mem_gate_alpha_init: float = 1.0, n_heads: int = 4):
         super().__init__()
         self.d_model = d_model
         self.top_m = top_m
         self.ocr_dim = ocr_dim
+        self.ocr_margin = float(ocr_margin)
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
 
@@ -163,7 +165,7 @@ class RFTMemoryLayer(nn.Module):
         self.ocr_alpha = nn.Parameter(torch.tensor(float(ocr_alpha_init)))
 
         # Gating scalar for residual addition
-        self.mem_gate_alpha = nn.Parameter(torch.tensor(0.0))
+        self.mem_gate_alpha = nn.Parameter(torch.tensor(float(mem_gate_alpha_init)))
 
     def _router_beta(self, q: torch.Tensor) -> torch.Tensor:
         base = F.softplus(self.recency_beta_raw)
@@ -198,7 +200,7 @@ class RFTMemoryLayer(nn.Module):
 
     def forward(self, x: torch.Tensor, memory_keys: torch.Tensor,
                 memory_vals: torch.Tensor, memory_positions: torch.Tensor,
-                current_pos_start: int) -> torch.Tensor:
+                current_pos_start: int, return_aux_loss: bool = False):
         """
         x: [B, L, D] current chunk hidden states
         memory_keys: [B, N_mem, D] past hidden states (key projections)
@@ -211,7 +213,10 @@ class RFTMemoryLayer(nn.Module):
         N_mem = memory_keys.shape[1]
 
         if N_mem == 0:
-            return torch.zeros_like(x)
+            out = torch.zeros_like(x)
+            if return_aux_loss:
+                return out, {"ocr_margin_loss": out.new_zeros(())}
+            return out
 
         M = min(self.top_m, N_mem)
 
@@ -259,16 +264,25 @@ class RFTMemoryLayer(nn.Module):
         ocr_s = self._ocr_scores(q_flat, cand_flat, scores_flat, recency_flat)
         attn_logits = scores_flat + ocr_s  # [BL, M]
 
-        attn_weights = F.softmax(attn_logits, dim=-1).unsqueeze(-1)  # [BL, M, 1]
+        attn_probs = F.softmax(attn_logits, dim=-1)  # [BL, M]
+        attn_weights = attn_probs.unsqueeze(-1)  # [BL, M, 1]
         retrieved = (attn_weights * cand_flat).sum(dim=1)  # [BL, D]
         retrieved = retrieved.reshape(B, L, D)
 
         # Gate and project
         gate = torch.sigmoid(self.gate(x))
         retrieved = self.mem_ln(retrieved)
-        out = self.out_proj(gate * retrieved)
+        out = torch.tanh(self.mem_gate_alpha) * self.out_proj(gate * retrieved)
 
-        return torch.tanh(self.mem_gate_alpha) * out
+        if return_aux_loss:
+            top2 = torch.topk(attn_probs, k=min(2, M), dim=-1).values
+            if top2.shape[-1] == 1:
+                top_gap = top2[:, 0]
+            else:
+                top_gap = top2[:, 0] - top2[:, 1]
+            ocr_margin_loss = F.relu(self.ocr_margin - top_gap).mean()
+            return out, {"ocr_margin_loss": ocr_margin_loss}
+        return out
 
 
 # ─────────────────────────────────────────────
@@ -314,6 +328,9 @@ class RFTLM(nn.Module):
         use_memory: bool = True,
         mem_top_m: int = 64,
         ocr_dim: int = 256,
+        ocr_alpha_init: float = 1e-2,
+        ocr_margin: float = 0.10,
+        mem_gate_alpha_init: float = 1.0,
     ):
         super().__init__()
         self.d_model = d_model
@@ -338,6 +355,9 @@ class RFTLM(nn.Module):
                 d_model=d_model,
                 top_m=mem_top_m,
                 ocr_dim=ocr_dim,
+                ocr_alpha_init=ocr_alpha_init,
+                ocr_margin=ocr_margin,
+                mem_gate_alpha_init=mem_gate_alpha_init,
             )
             # Projections to create memory entries from hidden states
             self.mem_key_proj = nn.Linear(d_model, d_model, bias=False)
@@ -371,6 +391,7 @@ class RFTLM(nn.Module):
         memory_positions: Optional[torch.Tensor] = None,  # [B, N_mem]
         pos_offset: int = 0,
         return_memory_state: bool = False,
+        return_aux_loss: bool = False,
     ) -> dict:
         B, L = input_ids.shape
         D = self.d_model
@@ -382,6 +403,7 @@ class RFTLM(nn.Module):
 
         new_mem_keys = None
         new_mem_vals = None
+        aux_losses = []
 
         for i, layer in enumerate(self.layers):
             x = layer(x, rope_cos, rope_sin, pos_offset)
@@ -395,10 +417,19 @@ class RFTLM(nn.Module):
 
                 # Retrieve from memory if available
                 if memory_keys is not None and memory_keys.shape[1] > 0:
-                    mem_ctx = self.memory_layer(
-                        x, memory_keys, memory_vals,
-                        memory_positions, pos_offset,
-                    )
+                    if return_aux_loss:
+                        mem_ctx, aux = self.memory_layer(
+                            x, memory_keys, memory_vals,
+                            memory_positions, pos_offset,
+                            return_aux_loss=True,
+                        )
+                        aux_losses.append(aux["ocr_margin_loss"])
+                    else:
+                        mem_ctx = self.memory_layer(
+                            x, memory_keys, memory_vals,
+                            memory_positions, pos_offset,
+                            return_aux_loss=False,
+                        )
                     x = x + mem_ctx
 
         x = self.ln_f(x)
@@ -408,6 +439,11 @@ class RFTLM(nn.Module):
         if return_memory_state and new_mem_keys is not None:
             out["new_mem_keys"] = new_mem_keys
             out["new_mem_vals"] = new_mem_vals
+        if return_aux_loss:
+            if aux_losses:
+                out["ocr_aux_loss"] = torch.stack(aux_losses).mean()
+            else:
+                out["ocr_aux_loss"] = logits.new_zeros(())
         return out
 
 
@@ -523,6 +559,7 @@ def train_step_chunked(
     chunk_size: int,
     memory_bank: MemoryBank,
     do_backward: bool = True,
+    ocr_loss_weight: float = 0.0,
 ) -> Tuple[torch.Tensor, dict]:
     """
     Process a long sequence in chunks, building memory as we go.
@@ -552,14 +589,17 @@ def train_step_chunked(
             memory_positions=mem_pos,
             pos_offset=start,
             return_memory_state=True,
+            return_aux_loss=(ocr_loss_weight > 0),
         )
 
         logits = out["logits"]  # [B, L, V]
-        loss = F.cross_entropy(
+        lm_loss = F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]),
             chunk_target.reshape(-1),
             ignore_index=-100,
         )
+        ocr_aux = out.get("ocr_aux_loss", logits.new_zeros(()))
+        loss = lm_loss + ocr_loss_weight * ocr_aux
 
         # Backward per chunk — keeps memory constant
         if do_backward:
@@ -586,6 +626,7 @@ def train_step_chunked(
         "n_chunks": n_chunks,
         "memory_size": memory_bank.size,
         "total_tokens": total_tokens,
+        "ocr_loss_weight": ocr_loss_weight,
     }
     return loss_out, metrics
 

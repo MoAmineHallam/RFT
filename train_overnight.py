@@ -173,6 +173,9 @@ def train_rft_lm(
             use_memory=True,
             mem_top_m=args.mem_top_m,
             ocr_dim=args.ocr_dim,
+            ocr_alpha_init=args.ocr_alpha_init,
+            ocr_margin=args.ocr_margin,
+            mem_gate_alpha_init=args.mem_gate_alpha_init,
         ).to(device)
     else:
         model = BaselineTransformerLM(
@@ -263,6 +266,7 @@ def train_rft_lm(
                 loss, metrics = train_step_chunked(
                     raw_model, batch, args.chunk_size, memory_bank,
                     do_backward=True,
+                    ocr_loss_weight=args.ocr_loss_weight,
                 )
             else:
                 # Standard training — process full sequence
@@ -437,6 +441,10 @@ def main():
     ap.add_argument("--memory_layer_idx", type=int, default=6)
     ap.add_argument("--mem_top_m", type=int, default=64)
     ap.add_argument("--ocr_dim", type=int, default=256)
+    ap.add_argument("--ocr_alpha_init", type=float, default=1e-2)
+    ap.add_argument("--ocr_margin", type=float, default=0.10)
+    ap.add_argument("--ocr_loss_weight", type=float, default=0.05)
+    ap.add_argument("--mem_gate_alpha_init", type=float, default=1.0)
 
     # Training config
     ap.add_argument("--total_seq_len", type=int, default=2048)

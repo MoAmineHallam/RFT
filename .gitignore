@@ -1,0 +1,22 @@
+@'
+data/
+runs_lm/
+__pycache__/
+*.pyc
+*.pyo
+*.pt
+*.pth
+*.ckpt
+*.jsonl
+*.log
+baseline_log.txt
+pilot_log.txt
+rftlm_log.txt
+overnight_log.txt
+c4-validation*.json
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+'@ | Set-Content .gitignore

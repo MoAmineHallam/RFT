@@ -1,0 +1,16 @@
+{
+  "explorer.fileNesting.enabled": true,
+  "explorer.fileNesting.patterns": {
+    "*.sh": "${capture}.py,${capture}.log",
+    "train_overnight.py": "run_overnight.sh,pilot_3h.sh"
+  },
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/*.pyc": true,
+    "**/*.pyo": true
+  },
+  "search.exclude": {
+    "data/": true,
+    "runs_lm/": true
+  }
+}

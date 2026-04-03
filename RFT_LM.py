@@ -162,8 +162,8 @@ class RFTMemoryLayer(nn.Module):
         )
         self.ocr_alpha = nn.Parameter(torch.tensor(float(ocr_alpha_init)))
 
-        # Gating scalar for residual addition
-        self.mem_gate_alpha = nn.Parameter(torch.tensor(0.0))
+        # Gating scalar for residual addition (init > 0 so memory is active from start)
+        self.mem_gate_alpha = nn.Parameter(torch.tensor(0.1))
 
     def _router_beta(self, q: torch.Tensor) -> torch.Tensor:
         base = F.softplus(self.recency_beta_raw)
@@ -270,6 +270,62 @@ class RFTMemoryLayer(nn.Module):
 
         return torch.tanh(self.mem_gate_alpha) * out
 
+    def ocr_contrastive_loss(
+        self, x: torch.Tensor, memory_keys: torch.Tensor,
+        memory_vals: torch.Tensor, memory_positions: torch.Tensor,
+        current_pos_start: int, margin: float = 0.10,
+    ) -> torch.Tensor:
+        """
+        Contrastive loss for OCR: encourages OCR to assign higher scores
+        to candidates with higher router scores (proxy for correctness).
+
+        Returns scalar loss (0 if no memory available).
+        """
+        B, L, D = x.shape
+        N_mem = memory_keys.shape[1]
+        if N_mem < 2:
+            return torch.tensor(0.0, device=x.device)
+
+        M = min(self.top_m, N_mem)
+        if M < 2:
+            return torch.tensor(0.0, device=x.device)
+
+        # Router scores (same as forward)
+        q = self.router_q(x)
+        scores = torch.einsum("bld,bnd->bln", q, memory_keys)
+        max_pos = max(current_pos_start + L - 1, 1)
+        recency_all = memory_positions.float() / max_pos
+        beta = self._router_beta(x)
+        scores = scores + beta.unsqueeze(-1) * recency_all.unsqueeze(1)
+        top_scores, top_idx = torch.topk(scores, k=M, dim=-1)
+
+        # Gather candidate values
+        cand_vals = torch.zeros(B, L, M, D, device=x.device, dtype=memory_vals.dtype)
+        for b in range(B):
+            cand_vals[b] = memory_vals[b][top_idx[b]]
+
+        # Recency features
+        top_positions = torch.zeros(B, L, M, device=x.device, dtype=memory_positions.dtype)
+        for b in range(B):
+            top_positions[b] = memory_positions[b][top_idx[b]]
+        recency_feat = top_positions.float() / max(max_pos, 1)
+
+        # OCR scores
+        BL = B * L
+        q_flat = x.reshape(BL, D)
+        cand_flat = cand_vals.reshape(BL, M, D)
+        scores_flat = top_scores.reshape(BL, M)
+        recency_flat = recency_feat.reshape(BL, M)
+
+        ocr_s = self._ocr_scores(q_flat, cand_flat, scores_flat, recency_flat)
+
+        # Contrastive: top-1 router candidate should beat others by margin
+        # Use router rank as proxy for "correct" candidate
+        best_ocr = ocr_s[:, 0:1]  # highest router-score candidate
+        others_ocr = ocr_s[:, 1:]  # rest
+        violations = F.relu(margin - (best_ocr - others_ocr))
+        return violations.mean()
+
 
 # ─────────────────────────────────────────────
 # Transformer Block
@@ -371,6 +427,8 @@ class RFTLM(nn.Module):
         memory_positions: Optional[torch.Tensor] = None,  # [B, N_mem]
         pos_offset: int = 0,
         return_memory_state: bool = False,
+        compute_ocr_loss: bool = False,
+        ocr_margin: float = 0.10,
     ) -> dict:
         B, L = input_ids.shape
         D = self.d_model
@@ -382,6 +440,7 @@ class RFTLM(nn.Module):
 
         new_mem_keys = None
         new_mem_vals = None
+        ocr_loss = None
 
         for i, layer in enumerate(self.layers):
             x = layer(x, rope_cos, rope_sin, pos_offset)
@@ -401,6 +460,13 @@ class RFTLM(nn.Module):
                     )
                     x = x + mem_ctx
 
+                    # OCR contrastive loss (trains OCR to disambiguate)
+                    if compute_ocr_loss:
+                        ocr_loss = self.memory_layer.ocr_contrastive_loss(
+                            x.detach(), memory_keys, memory_vals,
+                            memory_positions, pos_offset, margin=ocr_margin,
+                        )
+
         x = self.ln_f(x)
         logits = self.lm_head(x)  # [B, L, vocab_size]
 
@@ -408,6 +474,8 @@ class RFTLM(nn.Module):
         if return_memory_state and new_mem_keys is not None:
             out["new_mem_keys"] = new_mem_keys
             out["new_mem_vals"] = new_mem_vals
+        if ocr_loss is not None:
+            out["ocr_loss"] = ocr_loss
         return out
 
 
@@ -523,6 +591,8 @@ def train_step_chunked(
     chunk_size: int,
     memory_bank: MemoryBank,
     do_backward: bool = True,
+    ocr_loss_weight: float = 0.05,
+    ocr_margin: float = 0.10,
 ) -> Tuple[torch.Tensor, dict]:
     """
     Process a long sequence in chunks, building memory as we go.
@@ -534,6 +604,7 @@ def train_step_chunked(
 
     memory_bank.reset()
     total_loss_val = 0.0
+    total_ocr_loss_val = 0.0
     total_tokens = 0
     n_chunks = 0
 
@@ -552,21 +623,31 @@ def train_step_chunked(
             memory_positions=mem_pos,
             pos_offset=start,
             return_memory_state=True,
+            compute_ocr_loss=(ocr_loss_weight > 0),
+            ocr_margin=ocr_margin,
         )
 
         logits = out["logits"]  # [B, L, V]
-        loss = F.cross_entropy(
+        lm_loss = F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]),
             chunk_target.reshape(-1),
             ignore_index=-100,
         )
+
+        # Combine LM loss with OCR contrastive loss
+        loss = lm_loss
+        ocr_loss_val = 0.0
+        if "ocr_loss" in out and ocr_loss_weight > 0:
+            loss = loss + ocr_loss_weight * out["ocr_loss"]
+            ocr_loss_val = float(out["ocr_loss"].item())
 
         # Backward per chunk — keeps memory constant
         if do_backward:
             n_total_chunks = max((total_len - 1) // chunk_size, 1)
             (loss / n_total_chunks).backward()
 
-        total_loss_val += float(loss.item()) * L
+        total_loss_val += float(lm_loss.item()) * L
+        total_ocr_loss_val += ocr_loss_val * L
         total_tokens += L
         n_chunks += 1
 
@@ -579,10 +660,12 @@ def train_step_chunked(
             )
 
     avg_loss = total_loss_val / max(total_tokens, 1)
+    avg_ocr_loss = total_ocr_loss_val / max(total_tokens, 1)
     # Return a dummy tensor for API compatibility (already backwarded)
     loss_out = torch.tensor(avg_loss, device=device)
     metrics = {
         "loss": avg_loss,
+        "ocr_loss": avg_ocr_loss,
         "n_chunks": n_chunks,
         "memory_size": memory_bank.size,
         "total_tokens": total_tokens,

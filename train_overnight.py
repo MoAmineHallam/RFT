@@ -263,6 +263,8 @@ def train_rft_lm(
                 loss, metrics = train_step_chunked(
                     raw_model, batch, args.chunk_size, memory_bank,
                     do_backward=True,
+                    ocr_loss_weight=args.ocr_loss_weight,
+                    ocr_margin=args.ocr_margin,
                 )
             else:
                 # Standard training — process full sequence
@@ -312,11 +314,13 @@ def train_rft_lm(
                 mem_size = int(memory_bank.size) if memory_bank is not None else None
                 eta_sec = (total_steps - global_step) * (elapsed / max(batch_idx + 1, 1))
 
+                ocr_loss_val = metrics.get("ocr_loss", 0.0) if isinstance(metrics, dict) else 0.0
                 record = {
                     "step": int(global_step),
                     "epoch": int(epoch + 1),
                     "batch_idx": int(batch_idx + 1),
                     "loss": float(step_loss),
+                    "ocr_loss": float(ocr_loss_val),
                     "avg_recent": float(avg_recent),
                     "lr": float(lr_now),
                     "tok_per_sec": float(tok_per_sec),
@@ -437,6 +441,10 @@ def main():
     ap.add_argument("--memory_layer_idx", type=int, default=6)
     ap.add_argument("--mem_top_m", type=int, default=64)
     ap.add_argument("--ocr_dim", type=int, default=256)
+    ap.add_argument("--ocr_loss_weight", type=float, default=0.05,
+                    help="Weight for OCR contrastive loss (0 = disabled)")
+    ap.add_argument("--ocr_margin", type=float, default=0.10,
+                    help="Margin for OCR contrastive loss")
 
     # Training config
     ap.add_argument("--total_seq_len", type=int, default=2048)

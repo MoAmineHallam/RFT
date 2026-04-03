@@ -1,0 +1,26 @@
+{
+  "folders": [
+    {
+      "name": "RFT (repo)",
+      "path": "."
+    }
+  ],
+  "settings": {
+    "explorer.fileNesting.enabled": true,
+    "files.exclude": {
+      "**/__pycache__": true,
+      "**/*.pyc": true,
+      "**/*.pyo": true
+    },
+    "search.exclude": {
+      "data/": true,
+      "runs_lm/": true
+    }
+  },
+  "extensions": {
+    "recommendations": [
+      "ms-python.python",
+      "ms-python.vscode-pylance"
+    ]
+  }
+}

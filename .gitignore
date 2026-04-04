@@ -19,3 +19,10 @@ c4-validation*.json
 .idea/
 .DS_Store
 Thumbs.db
+results_summary.json
+results_table.csv
+error_log_summary.txt
+verdict.md
+driver.log
+runbook.txt
+runs_lm/matched_retrains_*/

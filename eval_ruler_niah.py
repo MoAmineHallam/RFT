@@ -1,31 +1,11 @@
 """
-eval_ruler_niah.py — RULER Single Needle-In-A-Haystack (S-NIAH) Benchmark
+eval_ruler_niah.py — Paper-grade RULER-style NIAH evaluator for local checkpoints.
 
-Evaluates RFT-LM and Baseline on the standard RULER S-NIAH task used by
-Titans, Mamba-2, DeltaNet, and other long-context papers.
-
-Task format:
-  - A key-value pair ("The special magic number for <KEY> is <VALUE>.")
-    is inserted at a random position in a long context of distractor text.
-  - Distractor text is real C4 validation text (or generated filler).
-  - The model is prompted at the end: "What is the special magic number for <KEY>?"
-  - We check if the model generates VALUE as its next tokens.
-  - Accuracy is measured across many trials at each context length.
-
-Published reference numbers at 125M scale (from Titans paper, Table 2):
-  - Titans MAC:   ~96-99% across 4K-32K
-  - Transformer+: ~90-95% at 4K, degrades at longer contexts
-  - Mamba-2:      ~85-92% at 4K, degrades at longer contexts
-  - DeltaNet:     ~88-95% at 4K, degrades at longer contexts
-
-Usage:
-    CUDA_VISIBLE_DEVICES=0 python eval_ruler_niah.py \
-        --rft_ckpt ./runs_lm/overnight_v2/rft_lm/best_model.pt \
-        --baseline_ckpt ./runs_lm/overnight_v2/baseline/best_model.pt \
-        --tokenizer_path ./gpt2_tokenizer \
-        --distractor_path ./data/c4_val.jsonl \
-        --seq_lens 2048 4096 8192 16384 \
-        --n_trials 100
+Adds:
+  - Depth-stratified sweep (single-depth or grid)
+  - Multi-key / multi-needle NIAH (MK-NIAH)
+  - Wilson confidence intervals
+  - RFT ablation hooks (disable memory, neutralize OCR influence)
 """
 
 import argparse
@@ -33,264 +13,289 @@ import json
 import math
 import os
 import random
-import time
-from typing import List, Optional, Tuple
+import uuid
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
-from RFT_LM import RFTLM, BaselineTransformerLM, MemoryBank
-
-
-# ─────────────────────────────────────────────
-# NIAH Task Construction
-# ─────────────────────────────────────────────
-
-# 100 distinct keys and values to avoid memorization
-NIAH_KEYS = [f"alpha_{i:03d}" for i in range(100)]
-NIAH_VALUES = [f"{random.Random(42 + i).randint(10000, 99999)}" for i in range(100)]
+from RFT_LM import BaselineTransformerLM, MemoryBank, RFTLM
 
 
-def load_distractor_tokens(
-    path: str, tokenizer, max_docs: int = 500
-) -> List[int]:
-    """Load and tokenize distractor text from C4 validation."""
+def string_match_all_binary(pred: str, refs: List[str]) -> bool:
+    if not refs:
+        return False
+    p = pred.lower()
+    return all(r.lower() in p for r in refs)
+
+
+def wilson_ci(k: int, n: int, z: float = 1.96) -> Tuple[float, float]:
+    if n == 0:
+        return (0.0, 0.0)
+    p = k / n
+    denom = 1.0 + (z * z) / n
+    center = (p + (z * z) / (2 * n)) / denom
+    margin = (z / denom) * math.sqrt((p * (1 - p) / n) + ((z * z) / (4 * n * n)))
+    lo = max(0.0, center - margin)
+    hi = min(1.0, center + margin)
+    return lo, hi
+
+
+def load_distractor_tokens(path: str, tokenizer, max_docs: int) -> List[int]:
     texts = []
     with open(path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f):
             if i >= max_docs:
                 break
             obj = json.loads(line)
-            texts.append(obj["text"])
-    all_tokens = []
-    for text in texts:
-        tokens = tokenizer.encode(text, add_special_tokens=False)
-        all_tokens.extend(tokens)
-    return all_tokens
+            txt = obj.get("text", "")
+            if txt:
+                texts.append(txt)
+    blob = " ".join(texts)
+    return tokenizer.encode(blob, add_special_tokens=False)
 
 
-def build_niah_sequence(
+def generate_value(rng: random.Random, value_type: str) -> str:
+    if value_type == "numbers":
+        return str(rng.randint(1_000_000, 9_999_999))
+    if value_type == "uuids":
+        return str(uuid.UUID(int=rng.getrandbits(128), version=4))
+    raise ValueError(f"Unsupported value_type={value_type}")
+
+
+def build_mk_niah_sample(
+    tokenizer,
     seq_len: int,
     distractor_tokens: List[int],
-    tokenizer,
-    key_idx: int,
-    needle_position_frac: float = None,
-    seed: int = 0,
-) -> Tuple[List[int], str, str, int]:
-    """
-    Build a single NIAH sequence.
-
-    Returns:
-        (token_ids, key, value, needle_start_pos)
-    """
+    seed: int,
+    value_type: str,
+    needle_depth: Optional[float],
+    num_needle_k: int,
+    num_needle_v: int,
+    num_needle_q: int,
+) -> Dict:
     rng = random.Random(seed)
+    num_needle_k = max(num_needle_k, num_needle_q)
 
-    key = NIAH_KEYS[key_idx % len(NIAH_KEYS)]
-    value = NIAH_VALUES[key_idx % len(NIAH_VALUES)]
+    keys = [f"alpha_{rng.randint(0, 99999):05d}_{i}" for i in range(num_needle_k)]
+    values_by_key: List[List[str]] = []
+    needle_sentences = []
 
-    # Needle sentence
-    needle_text = f" The special magic number for {key} is {value}. "
-    needle_tokens = tokenizer.encode(needle_text, add_special_tokens=False)
+    for k in keys:
+        vals = [generate_value(rng, value_type) for _ in range(num_needle_v)]
+        values_by_key.append(vals)
+        for v in vals:
+            needle_sentences.append(f"One of the special magic {value_type} for {k} is: {v}.")
 
-    # Query at the end
-    query_text = f" What is the special magic number for {key}? The answer is:"
-    query_tokens = tokenizer.encode(query_text, add_special_tokens=False)
+    # Query subset
+    q_idx = rng.sample(range(num_needle_k), k=num_needle_q)
+    query_keys = [keys[i] for i in q_idx]
+    ref_values = [v for i in q_idx for v in values_by_key[i]]
 
-    # Budget for distractor text
-    distractor_budget = seq_len - len(needle_tokens) - len(query_tokens)
-    if distractor_budget < 100:
-        raise ValueError(f"seq_len {seq_len} too short for NIAH task")
-
-    # Pick needle insertion position
-    if needle_position_frac is not None:
-        needle_pos = int(needle_position_frac * distractor_budget)
+    if len(query_keys) == 1:
+        query_str = query_keys[0]
+    elif len(query_keys) == 2:
+        query_str = f"{query_keys[0]} and {query_keys[1]}"
     else:
-        # Random position (avoid very start/end)
-        needle_pos = rng.randint(
-            max(1, distractor_budget // 10),
-            max(2, distractor_budget - distractor_budget // 10),
-        )
+        query_str = ", ".join(query_keys[:-1]) + f", and {query_keys[-1]}"
 
-    # Build distractor: sample a random contiguous block
-    max_start = max(0, len(distractor_tokens) - distractor_budget - 1)
+    prompt_prefix = (
+        f"Some special magic {value_type} are hidden within the following text. "
+        f"Make sure to memorize it. I will quiz you about the {value_type} afterwards.\n"
+    )
+    prompt_suffix = (
+        f"\nWhat are all the special magic {value_type} for {query_str} mentioned in the provided text?"
+        f" The special magic {value_type} for {query_str} mentioned in the provided text are"
+    )
+    prefix_toks = tokenizer.encode(prompt_prefix, add_special_tokens=False)
+    suffix_toks = tokenizer.encode(prompt_suffix, add_special_tokens=False)
+    needle_toks = [tokenizer.encode(" " + s + " ", add_special_tokens=False) for s in needle_sentences]
+    needles_total = sum(len(t) for t in needle_toks)
+
+    context_budget = seq_len - len(prefix_toks) - len(suffix_toks) - needles_total
+    if context_budget < 128:
+        raise ValueError("Sequence too short for current MK-NIAH settings")
+
+    max_start = max(0, len(distractor_tokens) - context_budget - 1)
     dist_start = rng.randint(0, max_start) if max_start > 0 else 0
-    distractor_chunk = distractor_tokens[dist_start:dist_start + distractor_budget]
+    distractor_chunk = distractor_tokens[dist_start:dist_start + context_budget]
+    while len(distractor_chunk) < context_budget:
+        extra_start = rng.randint(0, max(0, len(distractor_tokens) - 128)) if distractor_tokens else 0
+        distractor_chunk.extend(distractor_tokens[extra_start:extra_start + 128])
+    distractor_chunk = distractor_chunk[:context_budget]
 
-    # Pad if needed
-    while len(distractor_chunk) < distractor_budget:
-        wrap_start = rng.randint(0, max(0, len(distractor_tokens) - 100))
-        distractor_chunk.extend(distractor_tokens[wrap_start:wrap_start + 100])
-    distractor_chunk = distractor_chunk[:distractor_budget]
+    if needle_depth is None:
+        depth_positions = sorted(
+            rng.randint(max(1, context_budget // 10), max(2, context_budget - context_budget // 10))
+            for _ in needle_toks
+        )
+    else:
+        base = int(max(0.0, min(1.0, needle_depth)) * context_budget)
+        depth_positions = [min(context_budget - 1, max(0, base + i)) for i in range(len(needle_toks))]
 
-    # Assemble: distractor_before + needle + distractor_after + query
-    before = distractor_chunk[:needle_pos]
-    after = distractor_chunk[needle_pos:]
-    full_tokens = before + needle_tokens + after + query_tokens
+    # Interleave needles into distractor by position
+    context = []
+    cursor = 0
+    positions_frac = []
+    for pos, nt in sorted(zip(depth_positions, needle_toks), key=lambda x: x[0]):
+        pos = max(cursor, min(pos, context_budget))
+        context.extend(distractor_chunk[cursor:pos])
+        context.extend(nt)
+        positions_frac.append(pos / max(context_budget, 1))
+        cursor = pos
+    context.extend(distractor_chunk[cursor:])
 
-    # Truncate to exact seq_len
-    full_tokens = full_tokens[:seq_len]
+    input_ids = (prefix_toks + context + suffix_toks)[:seq_len]
+    return {
+        "input_ids": input_ids,
+        "refs": ref_values,
+        "needle_pos_fracs": positions_frac,
+        "query_keys": query_keys,
+    }
 
-    return full_tokens, key, value, needle_pos
+
+def maybe_apply_rft_ablation(model: RFTLM, mode: str):
+    # mode: none | disable_memory | disable_ocr
+    if mode == "none":
+        return
+    if mode == "disable_memory":
+        model.use_memory = False
+        return
+    if mode == "disable_ocr":
+        # Neutralize OCR contribution in retrieval logits.
+        if hasattr(model, "memory_layer") and hasattr(model.memory_layer, "ocr_alpha"):
+            with torch.no_grad():
+                model.memory_layer.ocr_alpha.fill_(0.0)
+        return
+    raise ValueError(f"Unknown rft_ablation={mode}")
 
 
-# ─────────────────────────────────────────────
-# Model Evaluation
-# ─────────────────────────────────────────────
+def _forward_chunk(model, x, pos_offset, use_memory, memory_bank, update_memory):
+    if use_memory:
+        mem_k, mem_v, mem_pos = memory_bank.get_state()
+        out = model(
+            x,
+            memory_keys=mem_k,
+            memory_vals=mem_v,
+            memory_positions=mem_pos,
+            pos_offset=pos_offset,
+            return_memory_state=update_memory,
+        )
+        if update_memory and "new_mem_keys" in out:
+            memory_bank.add(out["new_mem_keys"].detach(), out["new_mem_vals"].detach(), pos_offset, x.shape[1])
+        return out
+    return model(x, pos_offset=pos_offset)
+
 
 @torch.no_grad()
-def eval_niah_model(
+def generate_greedy(
     model,
-    tokenizer,
-    distractor_tokens: List[int],
-    seq_len: int,
+    input_ids: List[int],
     chunk_size: int,
+    max_new_tokens: int,
+    eos_token_id: Optional[int],
     device: torch.device,
     use_memory: bool,
-    n_trials: int = 100,
-    needle_depth: float = None,
-) -> dict:
-    """
-    Run NIAH evaluation for a single model at a single seq_len.
+) -> List[int]:
+    ids = torch.tensor([input_ids], dtype=torch.long, device=device)
+    total_len = ids.shape[1]
+    mb = MemoryBank(max_entries=65536) if use_memory else None
+    if mb is not None:
+        mb.reset()
 
-    Returns dict with accuracy and per-trial details.
-    """
-    model.eval()
-    correct = 0
-    total = 0
-    details = []
+    last_logits = None
+    for s in range(0, total_len, chunk_size):
+        e = min(total_len, s + chunk_size)
+        out = _forward_chunk(model, ids[:, s:e], s, use_memory, mb, True)
+        last_logits = out["logits"]
+    if last_logits is None:
+        return []
 
-    for trial in range(n_trials):
-        key_idx = trial % len(NIAH_KEYS)
+    logits = last_logits[:, -1, :]
+    out_ids = []
+    for i in range(max_new_tokens):
+        nxt = torch.argmax(logits, dim=-1, keepdim=True)
+        tid = int(nxt.item())
+        out_ids.append(tid)
+        if eos_token_id is not None and tid == eos_token_id:
+            break
+        out = _forward_chunk(model, nxt, total_len + i, use_memory, mb, True)
+        logits = out["logits"][:, -1, :]
+    return out_ids
 
-        tokens, key, value, needle_pos = build_niah_sequence(
+
+def eval_at_depth(
+    model,
+    tokenizer,
+    seq_len: int,
+    depth: Optional[float],
+    distractor_tokens: List[int],
+    chunk_size: int,
+    n_trials: int,
+    max_new_tokens: int,
+    seed: int,
+    value_type: str,
+    mk_num_keys: int,
+    mk_num_values: int,
+    mk_num_queries: int,
+    device: torch.device,
+    use_memory: bool,
+) -> Dict:
+    hits = 0
+    preds, refs, details = [], [], []
+    for t in range(n_trials):
+        sample = build_mk_niah_sample(
+            tokenizer=tokenizer,
             seq_len=seq_len,
             distractor_tokens=distractor_tokens,
-            tokenizer=tokenizer,
-            key_idx=key_idx,
-            needle_position_frac=needle_depth,
-            seed=trial * 7919 + seq_len,  # deterministic but varied
+            seed=seed + seq_len * 100_003 + t * 7_919,
+            value_type=value_type,
+            needle_depth=depth,
+            num_needle_k=mk_num_keys,
+            num_needle_v=mk_num_values,
+            num_needle_q=mk_num_queries,
         )
+        gen_ids = generate_greedy(
+            model=model,
+            input_ids=sample["input_ids"],
+            chunk_size=chunk_size,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=tokenizer.eos_token_id,
+            device=device,
+            use_memory=use_memory,
+        )
+        pred = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+        ref = sample["refs"]
+        ok = string_match_all_binary(pred, ref)
+        hits += int(ok)
+        preds.append(pred)
+        refs.append(ref)
+        details.append(
+            {
+                "trial": t,
+                "correct": ok,
+                "prediction": pred,
+                "refs": ref,
+                "needle_pos_fracs": sample["needle_pos_fracs"],
+                "query_keys": sample["query_keys"],
+            }
+        )
+        if (t + 1) % 20 == 0:
+            print(f"    trial {t+1}/{n_trials}: acc={100.0 * hits / (t+1):.2f}%")
 
-        input_ids = torch.tensor([tokens], dtype=torch.long, device=device)
-
-        # Chunked forward (same as eval_perplexity)
-        memory_bank = MemoryBank(max_entries=65536)
-        memory_bank.reset()
-
-        total_len = input_ids.shape[1]
-        last_logits = None
-
-        for start in range(0, total_len, chunk_size):
-            end = min(start + chunk_size, total_len)
-            chunk_input = input_ids[:, start:end]
-
-            if use_memory:
-                mem_k, mem_v, mem_pos = memory_bank.get_state()
-                try:
-                    out = model(
-                        chunk_input,
-                        memory_keys=mem_k,
-                        memory_vals=mem_v,
-                        memory_positions=mem_pos,
-                        pos_offset=start,
-                        return_memory_state=True,
-                    )
-                except torch.cuda.OutOfMemoryError:
-                    torch.cuda.empty_cache()
-                    details.append({"trial": trial, "correct": False, "oom": True})
-                    total += 1
-                    continue
-
-                if "new_mem_keys" in out:
-                    memory_bank.add(
-                        out["new_mem_keys"].detach(),
-                        out["new_mem_vals"].detach(),
-                        start, chunk_input.shape[1],
-                    )
-            else:
-                out = model(chunk_input, pos_offset=start)
-
-            last_logits = out["logits"]
-
-        if last_logits is None:
-            total += 1
-            details.append({"trial": trial, "correct": False, "error": "no_logits"})
-            continue
-
-        # Check: does the model predict the value tokens after the query?
-        # The last token of input is the last token of "The answer is:"
-        # We greedily decode from there
-        value_tokens = tokenizer.encode(f" {value}", add_special_tokens=False)
-        n_value_tokens = len(value_tokens)
-
-        # Get the logits for the last position of the input
-        # and greedily generate n_value_tokens
-        generated = []
-        logits_pos = last_logits[0, -1, :]  # logits after last input token
-
-        for gen_step in range(n_value_tokens):
-            pred_token = logits_pos.argmax().item()
-            generated.append(pred_token)
-
-            if gen_step < n_value_tokens - 1:
-                # Feed predicted token back (single-token forward)
-                next_input = torch.tensor([[pred_token]], device=device)
-                next_pos = total_len + gen_step
-
-                if use_memory:
-                    mem_k, mem_v, mem_pos = memory_bank.get_state()
-                    out = model(
-                        next_input,
-                        memory_keys=mem_k,
-                        memory_vals=mem_v,
-                        memory_positions=mem_pos,
-                        pos_offset=next_pos,
-                        return_memory_state=False,
-                    )
-                else:
-                    out = model(next_input, pos_offset=next_pos)
-                logits_pos = out["logits"][0, -1, :]
-
-        # Check exact match
-        is_correct = (generated == value_tokens)
-
-        # Also check if decoded text contains the value (more lenient)
-        generated_text = tokenizer.decode(generated).strip()
-        contains_value = value in generated_text
-
-        if is_correct or contains_value:
-            correct += 1
-
-        total += 1
-        details.append({
-            "trial": trial,
-            "key": key,
-            "value": value,
-            "correct_exact": is_correct,
-            "correct_contains": contains_value,
-            "generated_text": generated_text,
-            "needle_pos_frac": needle_pos / seq_len,
-        })
-
-        if (trial + 1) % 20 == 0:
-            print(f"    trial {trial + 1}/{n_trials}: "
-                  f"acc={correct}/{total} ({100*correct/total:.1f}%)")
-
-    accuracy = correct / max(total, 1)
+    lo, hi = wilson_ci(hits, n_trials)
     return {
-        "accuracy": accuracy,
-        "correct": correct,
-        "total": total,
+        "correct": hits,
+        "total": n_trials,
+        "accuracy": hits / max(n_trials, 1),
+        "ci95_low": lo,
+        "ci95_high": hi,
         "details": details,
     }
 
 
-# ─────────────────────────────────────────────
-# Model Loading (reuse from eval_perplexity)
-# ─────────────────────────────────────────────
-
-def load_rft_model(ckpt_path: str, device: torch.device):
-    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+def load_rft_model(path: str, device: torch.device) -> RFTLM:
+    ck = torch.load(path, map_location="cpu", weights_only=False)
     a = ck["args"]
     model = RFTLM(
         vocab_size=a["vocab_size"],
@@ -305,17 +310,15 @@ def load_rft_model(ckpt_path: str, device: torch.device):
         mem_top_m=a["mem_top_m"],
         ocr_dim=a["ocr_dim"],
     ).to(device)
-    state_dict = ck["model"]
-    if any(k.startswith("module.") for k in state_dict):
-        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict, strict=False)
-    print(f"[LOAD] RFT-LM: {sum(p.numel() for p in model.parameters()):,} params "
-          f"(step {ck['step']}, loss {ck['loss']:.4f})")
+    sd = ck["model"]
+    if any(k.startswith("module.") for k in sd):
+        sd = {k.replace("module.", ""): v for k, v in sd.items()}
+    model.load_state_dict(sd, strict=False)
     return model
 
 
-def load_baseline_model(ckpt_path: str, device: torch.device):
-    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+def load_baseline_model(path: str, device: torch.device) -> BaselineTransformerLM:
+    ck = torch.load(path, map_location="cpu", weights_only=False)
     a = ck["args"]
     model = BaselineTransformerLM(
         vocab_size=a["vocab_size"],
@@ -326,174 +329,174 @@ def load_baseline_model(ckpt_path: str, device: torch.device):
         dropout=0.0,
         max_len=65536,
     ).to(device)
-    state_dict = ck["model"]
-    if any(k.startswith("module.") for k in state_dict):
-        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict, strict=False)
-    print(f"[LOAD] Baseline: {sum(p.numel() for p in model.parameters()):,} params "
-          f"(step {ck['step']}, loss {ck['loss']:.4f})")
+    sd = ck["model"]
+    if any(k.startswith("module.") for k in sd):
+        sd = {k.replace("module.", ""): v for k, v in sd.items()}
+    model.load_state_dict(sd, strict=False)
     return model
 
 
-# ─────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────
+def make_depth_grid(arg_depth_grid: Optional[List[float]], arg_depth: Optional[float]) -> List[Optional[float]]:
+    if arg_depth_grid:
+        return [max(0.0, min(1.0, d)) for d in arg_depth_grid]
+    if arg_depth is not None:
+        return [max(0.0, min(1.0, arg_depth))]
+    # Paper-friendly default sweep
+    return [0.0, 0.25, 0.5, 0.75, 1.0]
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rft_ckpt", type=str, required=True)
     ap.add_argument("--baseline_ckpt", type=str, required=True)
     ap.add_argument("--tokenizer_path", type=str, required=True)
-    ap.add_argument("--distractor_path", type=str, required=True,
-                    help="Path to C4 val jsonl for distractor text")
-    ap.add_argument("--seq_lens", type=int, nargs="+",
-                    default=[2048, 4096, 8192, 16384])
+    ap.add_argument("--distractor_path", type=str, required=True)
+    ap.add_argument("--seq_lens", type=int, nargs="+", default=[2048, 4096, 8192, 16384])
     ap.add_argument("--chunk_size", type=int, default=512)
-    ap.add_argument("--n_trials", type=int, default=100,
-                    help="Number of NIAH trials per seq_len")
-    ap.add_argument("--needle_depth", type=float, default=None,
-                    help="Fixed needle position (0-1). None = random.")
+    ap.add_argument("--n_trials", type=int, default=500)
+    ap.add_argument("--max_new_tokens", type=int, default=128)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--needle_depth", type=float, default=None)
+    ap.add_argument("--needle_depth_grid", type=float, nargs="+", default=None)
+    ap.add_argument("--value_type", type=str, choices=["numbers", "uuids"], default="numbers")
+    ap.add_argument("--distractor_docs", type=int, default=2000)
+    ap.add_argument("--mk_num_keys", type=int, default=1)
+    ap.add_argument("--mk_num_values", type=int, default=1)
+    ap.add_argument("--mk_num_queries", type=int, default=1)
+    ap.add_argument("--rft_ablation", type=str, choices=["none", "disable_memory", "disable_ocr"], default="none")
     ap.add_argument("--outfile", type=str, default="niah_results.json")
-    ap.add_argument("--distractor_docs", type=int, default=500)
     args = ap.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
-    # Load tokenizer
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, use_fast=True)
     tokenizer.model_max_length = 10**9
-    print(f"[EVAL] Tokenizer: {args.tokenizer_path} (vocab={tokenizer.vocab_size})")
 
-    # Load distractor text
-    print(f"[EVAL] Loading distractor text from {args.distractor_path}...")
-    distractor_tokens = load_distractor_tokens(
-        args.distractor_path, tokenizer, max_docs=args.distractor_docs
-    )
+    depths = make_depth_grid(args.needle_depth_grid, args.needle_depth)
+
+    print(f"[EVAL] Device: {device}")
+    print(f"[EVAL] Depths: {depths}")
+    print(f"[EVAL] MK-NIAH: keys={args.mk_num_keys}, values/key={args.mk_num_values}, queried_keys={args.mk_num_queries}")
+    print(f"[EVAL] RFT ablation mode: {args.rft_ablation}")
+
+    distractor_tokens = load_distractor_tokens(args.distractor_path, tokenizer, args.distractor_docs)
     print(f"[EVAL] Distractor tokens: {len(distractor_tokens):,}")
-    print(f"[EVAL] Sequence lengths: {args.seq_lens}")
-    print(f"[EVAL] Trials per length: {args.n_trials}")
 
     all_results = {}
-
-    for seq_len in args.seq_lens:
-        print(f"\n{'='*60}")
-        print(f"  RULER S-NIAH @ seq_len={seq_len}")
-        print(f"{'='*60}")
-
-        if len(distractor_tokens) < seq_len:
-            print(f"  SKIP: not enough distractor tokens ({len(distractor_tokens)} < {seq_len})")
-            continue
-
-        # --- RFT-LM ---
-        print(f"\n  [RFT-LM] Loading...")
-        torch.cuda.empty_cache()
-        rft_model = load_rft_model(args.rft_ckpt, device)
-
-        print(f"  [RFT-LM] Evaluating S-NIAH ({args.n_trials} trials)...")
-        t0 = time.time()
-        rft_result = eval_niah_model(
-            rft_model, tokenizer, distractor_tokens,
-            seq_len=seq_len,
-            chunk_size=args.chunk_size,
-            device=device,
-            use_memory=True,
-            n_trials=args.n_trials,
-            needle_depth=args.needle_depth,
-        )
-        rft_result["time_s"] = round(time.time() - t0, 1)
-        print(f"  [RFT-LM] Accuracy: {rft_result['accuracy']:.1%} "
-              f"({rft_result['correct']}/{rft_result['total']}) "
-              f"Time: {rft_result['time_s']}s")
-
-        del rft_model
-        torch.cuda.empty_cache()
-
-        # --- Baseline ---
-        print(f"\n  [Baseline] Loading...")
-        bl_model = load_baseline_model(args.baseline_ckpt, device)
-
-        print(f"  [Baseline] Evaluating S-NIAH ({args.n_trials} trials)...")
-        t0 = time.time()
-        bl_result = eval_niah_model(
-            bl_model, tokenizer, distractor_tokens,
-            seq_len=seq_len,
-            chunk_size=args.chunk_size,
-            device=device,
-            use_memory=False,
-            n_trials=args.n_trials,
-            needle_depth=args.needle_depth,
-        )
-        bl_result["time_s"] = round(time.time() - t0, 1)
-        print(f"  [Baseline] Accuracy: {bl_result['accuracy']:.1%} "
-              f"({bl_result['correct']}/{bl_result['total']}) "
-              f"Time: {bl_result['time_s']}s")
-
-        del bl_model
-        torch.cuda.empty_cache()
-
-        # --- Comparison ---
-        delta = rft_result["accuracy"] - bl_result["accuracy"]
-        winner = "RFT-LM" if delta > 0 else ("Baseline" if delta < 0 else "Tie")
-
-        # Strip per-trial details for summary (keep in full results)
-        rft_summary = {k: v for k, v in rft_result.items() if k != "details"}
-        bl_summary = {k: v for k, v in bl_result.items() if k != "details"}
-
-        all_results[str(seq_len)] = {
-            "rft_lm": rft_result,
-            "baseline": bl_result,
-            "delta_acc": round(delta, 4),
-            "winner": winner,
-        }
-
-        print(f"\n  {'─'*50}")
-        print(f"  seq_len={seq_len}: {winner} wins")
-        print(f"    RFT-LM   acc={rft_result['accuracy']:.1%}")
-        print(f"    Baseline acc={bl_result['accuracy']:.1%}")
-        print(f"    Δ acc={delta:+.1%}")
-
-    # ── Summary ──
-    print(f"\n{'='*60}")
-    print(f"  RULER S-NIAH SUMMARY")
-    print(f"{'='*60}")
-    print(f"  {'SeqLen':<8} {'RFT-LM':<12} {'Baseline':<12} {'Δ':<10} {'Winner'}")
-    print(f"  {'─'*56}")
     for sl in args.seq_lens:
-        r = all_results.get(str(sl))
-        if r:
-            print(f"  {sl:<8} {r['rft_lm']['accuracy']:<12.1%} "
-                  f"{r['baseline']['accuracy']:<12.1%} "
-                  f"{r['delta_acc']:<+10.1%} {r['winner']}")
+        print(f"\n{'='*72}\n  seq_len={sl}\n{'='*72}")
+        all_results[str(sl)] = {}
 
-    print(f"\n  Reference (Titans paper, 125M scale):")
-    print(f"  {'Model':<20} {'4K':<8} {'8K':<8} {'16K':<8} {'32K':<8}")
-    print(f"  {'─'*50}")
-    print(f"  {'Titans MAC':<20} {'~97%':<8} {'~96%':<8} {'~95%':<8} {'~93%':<8}")
-    print(f"  {'Transformer+':<20} {'~92%':<8} {'~85%':<8} {'~70%':<8} {'~50%':<8}")
-    print(f"  {'Mamba-2':<20} {'~90%':<8} {'~82%':<8} {'~65%':<8} {'~45%':<8}")
+        print("  [RFT-LM] loading...")
+        rft = load_rft_model(args.rft_ckpt, device)
+        maybe_apply_rft_ablation(rft, args.rft_ablation)
 
-    # Save full results
-    outpath = os.path.join(os.path.dirname(args.rft_ckpt), "..", args.outfile)
-    # Strip details for JSON (too large), save separately
-    summary_results = {}
-    for sl, r in all_results.items():
-        summary_results[sl] = {
-            "rft_lm": {k: v for k, v in r["rft_lm"].items() if k != "details"},
-            "baseline": {k: v for k, v in r["baseline"].items() if k != "details"},
-            "delta_acc": r["delta_acc"],
-            "winner": r["winner"],
-        }
-    with open(outpath, "w") as f:
-        json.dump(summary_results, f, indent=2)
-    print(f"\n[SAVED] {outpath}")
+        print("  [Baseline] loading...")
+        baseline = load_baseline_model(args.baseline_ckpt, device)
 
-    # Save detailed per-trial results
-    detail_path = outpath.replace(".json", "_details.json")
-    with open(detail_path, "w") as f:
-        json.dump(all_results, f, indent=2)
+        for depth in depths:
+            depth_key = "random" if depth is None else f"{depth:.2f}"
+            print(f"\n  --- depth={depth_key} ---")
+
+            rft_res = eval_at_depth(
+                model=rft,
+                tokenizer=tokenizer,
+                seq_len=sl,
+                depth=depth,
+                distractor_tokens=distractor_tokens,
+                chunk_size=args.chunk_size,
+                n_trials=args.n_trials,
+                max_new_tokens=args.max_new_tokens,
+                seed=args.seed,
+                value_type=args.value_type,
+                mk_num_keys=args.mk_num_keys,
+                mk_num_values=args.mk_num_values,
+                mk_num_queries=args.mk_num_queries,
+                device=device,
+                use_memory=(args.rft_ablation != "disable_memory"),
+            )
+            print(
+                f"    RFT-LM: {100*rft_res['accuracy']:.2f}% "
+                f"[{100*rft_res['ci95_low']:.2f}, {100*rft_res['ci95_high']:.2f}]"
+            )
+
+            bl_res = eval_at_depth(
+                model=baseline,
+                tokenizer=tokenizer,
+                seq_len=sl,
+                depth=depth,
+                distractor_tokens=distractor_tokens,
+                chunk_size=args.chunk_size,
+                n_trials=args.n_trials,
+                max_new_tokens=args.max_new_tokens,
+                seed=args.seed,
+                value_type=args.value_type,
+                mk_num_keys=args.mk_num_keys,
+                mk_num_values=args.mk_num_values,
+                mk_num_queries=args.mk_num_queries,
+                device=device,
+                use_memory=False,
+            )
+            print(
+                f"    Baseline: {100*bl_res['accuracy']:.2f}% "
+                f"[{100*bl_res['ci95_low']:.2f}, {100*bl_res['ci95_high']:.2f}]"
+            )
+
+            all_results[str(sl)][depth_key] = {
+                "rft_lm": rft_res,
+                "baseline": bl_res,
+                "delta_acc": rft_res["accuracy"] - bl_res["accuracy"],
+            }
+
+        del rft, baseline
+        torch.cuda.empty_cache()
+
+    print(f"\n{'='*72}\n  HEATMAP TABLE (accuracy %)\n{'='*72}")
+    for sl in args.seq_lens:
+        row = []
+        for depth in depths:
+            key = "random" if depth is None else f"{depth:.2f}"
+            rec = all_results[str(sl)][key]
+            row.append(
+                f"d={key}: RFT {100*rec['rft_lm']['accuracy']:.1f} | "
+                f"Base {100*rec['baseline']['accuracy']:.1f}"
+            )
+        print(f"  L={sl}: " + " || ".join(row))
+
+    print("\n[NOTE] For fair paper framing, compare against published Titans/Mamba numbers externally using matching task config.")
+
+    out_dir = str(Path(args.rft_ckpt).resolve().parent.parent)
+    out_path = os.path.join(out_dir, args.outfile)
+
+    summary = {
+        "config": vars(args),
+        "results": {
+            sl: {
+                d: {
+                    "rft_lm": {k: v for k, v in rec["rft_lm"].items() if k != "details"},
+                    "baseline": {k: v for k, v in rec["baseline"].items() if k != "details"},
+                    "delta_acc": rec["delta_acc"],
+                }
+                for d, rec in depth_map.items()
+            }
+            for sl, depth_map in all_results.items()
+        },
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[SAVED] {out_path}")
+
+    detail_path = out_path.replace(".json", "_details.json")
+    with open(detail_path, "w", encoding="utf-8") as f:
+        json.dump({"config": vars(args), "results": all_results}, f, indent=2)
     print(f"[SAVED] {detail_path}")
 
 
 if __name__ == "__main__":
     main()
+

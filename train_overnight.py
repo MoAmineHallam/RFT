@@ -132,8 +132,14 @@ def train_rft_lm(
     is_main = (rank == 0)
 
     if is_main:
+        model_label = {
+            "rft_lm": "RFT-LM",
+            "rft_lm_disable_memory": "RFT-LM (disable_memory)",
+            "rft_lm_disable_ocr": "RFT-LM (disable_ocr)",
+            "baseline": "Baseline Transformer",
+        }.get(args.model, args.model)
         print(f"\n{'='*70}")
-        print(f"  Training: {'RFT-LM' if args.model == 'rft_lm' else 'Baseline Transformer'}")
+        print(f"  Training: {model_label}")
         print(f"  GPUs: {world_size}, Device: {device}")
         print(f"{'='*70}")
 
@@ -160,7 +166,9 @@ def train_rft_lm(
     )
 
     # Build model
-    if args.model == "rft_lm":
+    is_rft_variant = args.model in {"rft_lm", "rft_lm_disable_memory", "rft_lm_disable_ocr"}
+    use_memory = args.model != "rft_lm_disable_memory"
+    if is_rft_variant:
         model = RFTLM(
             vocab_size=args.vocab_size,
             d_model=args.d_model,
@@ -170,10 +178,14 @@ def train_rft_lm(
             ff_mult=args.ff_mult,
             dropout=args.dropout,
             memory_layer_idx=args.memory_layer_idx,
-            use_memory=True,
+            use_memory=use_memory,
             mem_top_m=args.mem_top_m,
             ocr_dim=args.ocr_dim,
         ).to(device)
+        if args.model == "rft_lm_disable_ocr" and hasattr(model, "memory_layer") and hasattr(model.memory_layer, "ocr_alpha"):
+            with torch.no_grad():
+                model.memory_layer.ocr_alpha.fill_(0.0)
+            model.memory_layer.ocr_alpha.requires_grad_(False)
     else:
         model = BaselineTransformerLM(
             vocab_size=args.vocab_size,
@@ -190,9 +202,10 @@ def train_rft_lm(
         print(f"[MODEL] {args.model}: {n_params:,} params")
         print(f"[MODEL] d_model={args.d_model}, n_layers={args.n_layers}, "
               f"n_heads={args.n_heads}, window={args.window_size}")
-        if args.model == "rft_lm":
+        if is_rft_variant:
             print(f"[MODEL] memory_layer_idx={args.memory_layer_idx}, "
                   f"mem_top_m={args.mem_top_m}, ocr_dim={args.ocr_dim}")
+            print(f"[MODEL] use_memory={use_memory}")
 
     # DDP wrap
     if world_size > 1:
@@ -223,7 +236,7 @@ def train_rft_lm(
               f"seq_len={args.total_seq_len}, chunk_size={args.chunk_size}")
         print(f"[TRAIN] lr={args.lr}, warmup={warmup_steps}\n")
 
-    memory_bank = MemoryBank(max_entries=args.total_seq_len) if args.model == "rft_lm" else None
+    memory_bank = MemoryBank(max_entries=args.total_seq_len) if is_rft_variant else None
     
     global_step = 0
     best_loss = float("inf")
@@ -257,13 +270,14 @@ def train_rft_lm(
 
             opt.zero_grad()
 
-            if args.model == "rft_lm":
+            if is_rft_variant:
                 # Chunked training with memory
                 memory_bank.reset()
+                effective_ocr_loss_weight = args.ocr_loss_weight if args.model == "rft_lm" else 0.0
                 loss, metrics = train_step_chunked(
                     raw_model, batch, args.chunk_size, memory_bank,
                     do_backward=True,
-                    ocr_loss_weight=args.ocr_loss_weight,
+                    ocr_loss_weight=effective_ocr_loss_weight,
                     ocr_margin=args.ocr_margin,
                 )
             else:
@@ -417,13 +431,13 @@ def main():
 
     # Data
     ap.add_argument("--data_path", type=str, required=True)
-    ap.add_argument("--outdir", type=str, default="./runs_lm/overnight")
+    ap.add_argument("--outdir", type=str, default="/data/AmineHL_data/overnight")
     ap.add_argument("--max_docs", type=int, default=None,
                     help="Limit number of documents (None = use all)")
 
     # Model selection
     ap.add_argument("--model", type=str, default="rft_lm",
-                    choices=["rft_lm", "baseline"])
+                    choices=["rft_lm", "rft_lm_disable_memory", "rft_lm_disable_ocr", "baseline"])
 
     # Model architecture
     ap.add_argument("--vocab_size", type=int, default=50257,

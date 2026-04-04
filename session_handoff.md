@@ -1,5 +1,19 @@
 # Session Handoff — RFT / RFT-OCR / RFT-LM Repository
 ## Date: April 2, 2026
+
+## Status Update (April 4, 2026)
+
+This handoff captured the project state before the latest rigorous checkpoint-only LM reevaluation.
+
+Newer reproducible evaluation artifacts now exist under:
+
+- `runs_lm/evals_20260404/results_summary.json`
+- `runs_lm/evals_20260404/results_table.csv`
+- `runs_lm/evals_20260404/verdict.md`
+
+Under that protocol (fixed seeds, matched tokenizer/data slices, long-context seq-len sweep, ablations, CI), **RFT-LM did not show a robust LM advantage over baseline** for the currently available checkpoints.
+
+Interpret this file as historical context; use the above artifacts for latest quantitative conclusions.
 ## Purpose
 This document is a repository-level handoff for the RFT research project. It summarizes the research goal, architecture, completed work, exact current experimental status, the new 4×4090 server setup, and the strongest results currently in hand. It is written for continuity inside the repo and avoids tasking language aimed at a future assistant.
 

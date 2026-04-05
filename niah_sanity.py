@@ -38,7 +38,8 @@ from eval_ruler_niah import (
 
 
 def run_sanity(model, tokenizer, distractor_tokens, seq_len, depth, n_trials,
-               max_new_tokens, chunk_size, device, use_memory, tag, seed):
+               max_new_tokens, chunk_size, device, use_memory, tag, seed,
+               prompt_style="continuation"):
     hits = 0
     print(f"\n=== {tag} ===")
     for t in range(n_trials):
@@ -52,6 +53,7 @@ def run_sanity(model, tokenizer, distractor_tokens, seq_len, depth, n_trials,
             num_needle_k=1,
             num_needle_v=1,
             num_needle_q=1,
+            prompt_style=prompt_style,
         )
         gen_ids = generate_greedy(
             model=model,
@@ -92,6 +94,8 @@ def main():
     ap.add_argument("--chunk_size", type=int, default=256)
     ap.add_argument("--distractor_docs", type=int, default=200)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--prompt_style", type=str, choices=["instruct", "continuation"],
+                    default="continuation")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -113,6 +117,7 @@ def main():
         baseline, tokenizer, distractor_tokens, args.seq_len, args.depth,
         args.n_trials, args.max_new_tokens, args.chunk_size, device,
         use_memory=False, tag="BASELINE", seed=args.seed,
+        prompt_style=args.prompt_style,
     )
     del baseline
     torch.cuda.empty_cache()
@@ -124,6 +129,7 @@ def main():
         rft, tokenizer, distractor_tokens, args.seq_len, args.depth,
         args.n_trials, args.max_new_tokens, args.chunk_size, device,
         use_memory=True, tag="RFT-LM", seed=args.seed,
+        prompt_style=args.prompt_style,
     )
     del rft
     torch.cuda.empty_cache()

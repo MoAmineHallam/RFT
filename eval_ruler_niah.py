@@ -73,19 +73,28 @@ def build_mk_niah_sample(
     num_needle_k: int,
     num_needle_v: int,
     num_needle_q: int,
+    prompt_style: str = "instruct",
 ) -> Dict:
     rng = random.Random(seed)
     num_needle_k = max(num_needle_k, num_needle_q)
 
-    keys = [f"alpha_{rng.randint(0, 99999):05d}_{i}" for i in range(num_needle_k)]
+    keys = [f"alpha{rng.randint(0, 99999):05d}{i}" for i in range(num_needle_k)]
     values_by_key: List[List[str]] = []
     needle_sentences = []
 
-    for k in keys:
-        vals = [generate_value(rng, value_type) for _ in range(num_needle_v)]
-        values_by_key.append(vals)
-        for v in vals:
-            needle_sentences.append(f"One of the special magic {value_type} for {k} is: {v}.")
+    # continuation style: bare assertion; instruct style: labeled sentence
+    if prompt_style == "continuation":
+        for k in keys:
+            vals = [generate_value(rng, value_type) for _ in range(num_needle_v)]
+            values_by_key.append(vals)
+            for v in vals:
+                needle_sentences.append(f"The magic number {k} is {v}.")
+    else:
+        for k in keys:
+            vals = [generate_value(rng, value_type) for _ in range(num_needle_v)]
+            values_by_key.append(vals)
+            for v in vals:
+                needle_sentences.append(f"One of the special magic {value_type} for {k} is: {v}.")
 
     # Query subset
     q_idx = rng.sample(range(num_needle_k), k=num_needle_q)
@@ -99,14 +108,20 @@ def build_mk_niah_sample(
     else:
         query_str = ", ".join(query_keys[:-1]) + f", and {query_keys[-1]}"
 
-    prompt_prefix = (
-        f"Some special magic {value_type} are hidden within the following text. "
-        f"Make sure to memorize it. I will quiz you about the {value_type} afterwards.\n"
-    )
-    prompt_suffix = (
-        f"\nWhat are all the special magic {value_type} for {query_str} mentioned in the provided text?"
-        f" The special magic {value_type} for {query_str} mentioned in the provided text are"
-    )
+    if prompt_style == "continuation":
+        # No instruction. Just a bare probe that the model must complete.
+        # Pattern in context: "The magic number K is V." -> probe "The magic number K is"
+        prompt_prefix = ""
+        prompt_suffix = f"\nThe magic number {query_str} is"
+    else:
+        prompt_prefix = (
+            f"Some special magic {value_type} are hidden within the following text. "
+            f"Make sure to memorize it. I will quiz you about the {value_type} afterwards.\n"
+        )
+        prompt_suffix = (
+            f"\nWhat are all the special magic {value_type} for {query_str} mentioned in the provided text?"
+            f" The special magic {value_type} for {query_str} mentioned in the provided text are"
+        )
     prefix_toks = tokenizer.encode(prompt_prefix, add_special_tokens=False)
     suffix_toks = tokenizer.encode(prompt_suffix, add_special_tokens=False)
     needle_toks = [tokenizer.encode(" " + s + " ", add_special_tokens=False) for s in needle_sentences]
@@ -240,6 +255,7 @@ def eval_at_depth(
     mk_num_queries: int,
     device: torch.device,
     use_memory: bool,
+    prompt_style: str = "instruct",
 ) -> Dict:
     hits = 0
     preds, refs, details = [], [], []
@@ -254,6 +270,7 @@ def eval_at_depth(
             num_needle_k=mk_num_keys,
             num_needle_v=mk_num_values,
             num_needle_q=mk_num_queries,
+            prompt_style=prompt_style,
         )
         gen_ids = generate_greedy(
             model=model,
@@ -364,6 +381,8 @@ def main():
     ap.add_argument("--mk_num_values", type=int, default=1)
     ap.add_argument("--mk_num_queries", type=int, default=1)
     ap.add_argument("--rft_ablation", type=str, choices=["none", "disable_memory", "disable_ocr"], default="none")
+    ap.add_argument("--prompt_style", type=str, choices=["instruct", "continuation"], default="continuation",
+                    help="continuation: bare probe for base LMs. instruct: RULER-style template.")
     ap.add_argument("--outfile", type=str, default="niah_results.json")
     args = ap.parse_args()
 
@@ -417,6 +436,7 @@ def main():
                 mk_num_keys=args.mk_num_keys,
                 mk_num_values=args.mk_num_values,
                 mk_num_queries=args.mk_num_queries,
+                prompt_style=args.prompt_style,
                 device=device,
                 use_memory=(args.rft_ablation != "disable_memory"),
             )
@@ -439,6 +459,7 @@ def main():
                 mk_num_keys=args.mk_num_keys,
                 mk_num_values=args.mk_num_values,
                 mk_num_queries=args.mk_num_queries,
+                prompt_style=args.prompt_style,
                 device=device,
                 use_memory=False,
             )

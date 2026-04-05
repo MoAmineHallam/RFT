@@ -382,7 +382,9 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--needle_depth", type=float, default=None)
     ap.add_argument("--needle_depth_grid", type=float, nargs="+", default=None)
-    ap.add_argument("--value_type", type=str, choices=["numbers", "uuids"], default="numbers")
+    ap.add_argument("--value_type", type=str,
+                    choices=["numbers", "short_int", "digit2", "uuids"],
+                    default="digit2")
     ap.add_argument("--distractor_docs", type=int, default=2000)
     ap.add_argument("--mk_num_keys", type=int, default=1)
     ap.add_argument("--mk_num_values", type=int, default=1)

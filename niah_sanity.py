@@ -39,7 +39,8 @@ from eval_ruler_niah import (
 
 def run_sanity(model, tokenizer, distractor_tokens, seq_len, depth, n_trials,
                max_new_tokens, chunk_size, device, use_memory, tag, seed,
-               prompt_style="continuation"):
+               prompt_style="continuation", value_type="numbers",
+               mk_num_keys=1, mk_num_queries=1):
     hits = 0
     print(f"\n=== {tag} ===")
     for t in range(n_trials):
@@ -48,11 +49,11 @@ def run_sanity(model, tokenizer, distractor_tokens, seq_len, depth, n_trials,
             seq_len=seq_len,
             distractor_tokens=distractor_tokens,
             seed=seed + t * 7919,
-            value_type="numbers",
+            value_type=value_type,
             needle_depth=depth,
-            num_needle_k=1,
+            num_needle_k=mk_num_keys,
             num_needle_v=1,
-            num_needle_q=1,
+            num_needle_q=mk_num_queries,
             prompt_style=prompt_style,
         )
         gen_ids = generate_greedy(
@@ -96,6 +97,10 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--prompt_style", type=str, choices=["instruct", "continuation"],
                     default="continuation")
+    ap.add_argument("--value_type", type=str, choices=["numbers", "short_int", "uuids"],
+                    default="short_int")
+    ap.add_argument("--mk_num_keys", type=int, default=3)
+    ap.add_argument("--mk_num_queries", type=int, default=1)
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -118,6 +123,9 @@ def main():
         args.n_trials, args.max_new_tokens, args.chunk_size, device,
         use_memory=False, tag="BASELINE", seed=args.seed,
         prompt_style=args.prompt_style,
+        value_type=args.value_type,
+        mk_num_keys=args.mk_num_keys,
+        mk_num_queries=args.mk_num_queries,
     )
     del baseline
     torch.cuda.empty_cache()
@@ -130,6 +138,9 @@ def main():
         args.n_trials, args.max_new_tokens, args.chunk_size, device,
         use_memory=True, tag="RFT-LM", seed=args.seed,
         prompt_style=args.prompt_style,
+        value_type=args.value_type,
+        mk_num_keys=args.mk_num_keys,
+        mk_num_queries=args.mk_num_queries,
     )
     del rft
     torch.cuda.empty_cache()

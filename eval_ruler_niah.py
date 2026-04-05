@@ -58,6 +58,9 @@ def load_distractor_tokens(path: str, tokenizer, max_docs: int) -> List[int]:
 def generate_value(rng: random.Random, value_type: str) -> str:
     if value_type == "numbers":
         return str(rng.randint(1_000_000, 9_999_999))
+    if value_type == "short_int":
+        # 3-digit int: usually tokenizes to 1 BPE piece with leading space in GPT-2
+        return str(rng.randint(100, 999))
     if value_type == "uuids":
         return str(uuid.UUID(int=rng.getrandbits(128), version=4))
     raise ValueError(f"Unsupported value_type={value_type}")

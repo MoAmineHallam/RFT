@@ -44,6 +44,7 @@ from RFT_LM import (
     RFTLM, BaselineTransformerLM, MemoryBank,
     train_step_chunked,
 )
+from synth_batch import SynthBatchConfig, SyntheticKVBatchGen, synthetic_retrieval_step
 
 
 # ─────────────────────────────────────────────
@@ -237,7 +238,38 @@ def train_rft_lm(
         print(f"[TRAIN] lr={args.lr}, warmup={warmup_steps}\n")
 
     memory_bank = MemoryBank(max_entries=args.total_seq_len) if is_rft_variant else None
-    
+
+    # Synthetic retrieval batch generator (only for rft_lm with memory enabled)
+    use_synth = is_rft_variant and use_memory and args.model == "rft_lm" and args.synth_ratio > 0
+    synth_gen = None
+    synth_loss_weights = {
+        "router_ce": args.synth_router_w,
+        "topm_hinge": args.synth_topm_w,
+        "pointer_ce": args.synth_pointer_w,
+        "ocr_contrastive": args.synth_ocr_w,
+    }
+    if use_synth:
+        synth_cfg = SynthBatchConfig(
+            chunk_size=args.chunk_size,
+            key_vocab=args.synth_key_vocab,
+            val_vocab=args.synth_val_vocab,
+            num_facts=args.synth_num_facts,
+            num_decoys=args.synth_num_decoys,
+            batch_size=args.synth_batch_size,
+        )
+        synth_gen = SyntheticKVBatchGen(synth_cfg, device=device, seed=args.seed + rank)
+        assert synth_gen.max_token_id() < args.vocab_size, (
+            f"synth vocab exceeds model vocab_size ({synth_gen.max_token_id()} >= {args.vocab_size})"
+        )
+        if is_main:
+            print(f"[SYNTH] mixed-objective ON: ratio {args.synth_ratio:.2f}->{args.synth_ratio_end:.2f}, "
+                  f"bs={args.synth_batch_size} chunk={args.chunk_size} facts={args.synth_num_facts} "
+                  f"decoys={args.synth_num_decoys}")
+            print(f"[SYNTH] loss weights: router={args.synth_router_w} topm={args.synth_topm_w} "
+                  f"ptr={args.synth_pointer_w} ocr={args.synth_ocr_w} scale={args.synth_loss_scale}")
+
+    rng_synth = random.Random(args.seed + 1000 + rank)
+
     global_step = 0
     best_loss = float("inf")
     log_interval = args.log_interval
@@ -269,6 +301,53 @@ def train_rft_lm(
             target_ids = batch[:, 1:]  # [B, seq_len]
 
             opt.zero_grad()
+
+            # Decide whether this step is a synthetic-retrieval step
+            if use_synth:
+                progress = global_step / max(total_steps, 1)
+                cur_synth_ratio = args.synth_ratio + progress * (args.synth_ratio_end - args.synth_ratio)
+            else:
+                cur_synth_ratio = 0.0
+            do_synth_step = use_synth and (rng_synth.random() < cur_synth_ratio)
+
+            if do_synth_step:
+                synth_batch = next(synth_gen)
+                # Scale into the backward via synth_loss_scale by temporarily rescaling weights
+                scaled_weights = {k: v * args.synth_loss_scale for k, v in synth_loss_weights.items()}
+                _, synth_metrics = synthetic_retrieval_step(
+                    raw_model, synth_batch, scaled_weights, do_backward=True,
+                )
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                scheduler.step()
+
+                step_loss = synth_metrics["synth_loss"]
+                metrics = {"loss": step_loss, "is_synth": 1.0, **synth_metrics}
+                epoch_loss += step_loss
+                epoch_tokens += args.synth_batch_size * args.chunk_size * 2
+                global_step += 1
+                all_losses.append(step_loss)
+
+                if is_main and (global_step % log_interval == 0 or global_step == 1):
+                    print(
+                        f"  step {global_step:5d} | SYNTH loss {step_loss:.4f} | "
+                        f"router_ce {synth_metrics['synth_router_ce']:.3f} | "
+                        f"ptr_ce {synth_metrics['synth_pointer_ce']:.3f} | "
+                        f"recall@M {synth_metrics['synth_recall_at_m']:.3f} | "
+                        f"ptr_acc {synth_metrics['synth_pointer_acc']:.3f} | "
+                        f"ratio {cur_synth_ratio:.2f}",
+                        flush=True,
+                    )
+                    record = {
+                        "step": int(global_step),
+                        "is_synth": 1,
+                        "loss": float(step_loss),
+                        **{k: float(v) for k, v in synth_metrics.items()},
+                        "synth_ratio": float(cur_synth_ratio),
+                    }
+                    with open(metrics_path, "a") as f:
+                        f.write(json.dumps(record) + "\n")
+                continue
 
             if is_rft_variant:
                 # Chunked training with memory
@@ -455,10 +534,29 @@ def main():
     ap.add_argument("--memory_layer_idx", type=int, default=6)
     ap.add_argument("--mem_top_m", type=int, default=64)
     ap.add_argument("--ocr_dim", type=int, default=256)
-    ap.add_argument("--ocr_loss_weight", type=float, default=0.05,
-                    help="Weight for OCR contrastive loss (0 = disabled)")
+    ap.add_argument("--ocr_loss_weight", type=float, default=0.0,
+                    help="Weight for self-supervised circular OCR loss on C4 batches "
+                         "(keep 0 when using synthetic supervision).")
     ap.add_argument("--ocr_margin", type=float, default=0.10,
-                    help="Margin for OCR contrastive loss")
+                    help="Margin for self-supervised OCR loss")
+
+    # Mixed-objective synthetic retrieval supervision
+    ap.add_argument("--synth_ratio", type=float, default=0.30,
+                    help="Probability of replacing a C4 step with a synthetic "
+                         "KV-retrieval step at the start of training.")
+    ap.add_argument("--synth_ratio_end", type=float, default=0.10,
+                    help="synth_ratio anneals linearly to this value by end of run.")
+    ap.add_argument("--synth_loss_scale", type=float, default=1.0,
+                    help="Global scale on the synthetic retrieval loss.")
+    ap.add_argument("--synth_batch_size", type=int, default=4)
+    ap.add_argument("--synth_num_facts", type=int, default=8)
+    ap.add_argument("--synth_num_decoys", type=int, default=64)
+    ap.add_argument("--synth_key_vocab", type=int, default=2048)
+    ap.add_argument("--synth_val_vocab", type=int, default=2048)
+    ap.add_argument("--synth_router_w", type=float, default=1.0)
+    ap.add_argument("--synth_topm_w", type=float, default=0.25)
+    ap.add_argument("--synth_pointer_w", type=float, default=0.5)
+    ap.add_argument("--synth_ocr_w", type=float, default=0.2)
 
     # Training config
     ap.add_argument("--total_seq_len", type=int, default=2048)

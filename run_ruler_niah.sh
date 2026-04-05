@@ -77,13 +77,16 @@ for SEED in 42 43 44; do
       --baseline_ckpt "$BL_CKPT" \
       --tokenizer_path "$TOK" \
       --distractor_path "$DISTRACTOR" \
-      --seq_lens 2048 4096 8192 16384 \
-      --needle_depth_grid 0.0 0.25 0.5 0.75 1.0 \
+      --seq_lens 1024 2048 4096 8192 \
+      --needle_depth_grid 0.1 0.3 0.5 0.7 0.9 \
       --n_trials 200 \
-      --max_new_tokens 32 \
+      --max_new_tokens 3 \
       --chunk_size 512 \
       --seed "$SEED" \
-      --distractor_docs 2000 \
+      --distractor_docs 4000 \
+      --prompt_style continuation \
+      --value_type digit2 \
+      --mk_num_keys 3 --mk_num_values 1 --mk_num_queries 1 \
       --outfile "niah_seed${SEED}.json" \
       2>&1 | tee "$OUT/niah_seed${SEED}.log"; then
     echo "FAIL niah seed=$SEED" | tee -a "$ERRORS" "$RUNBOOK"

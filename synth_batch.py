@@ -166,5 +166,6 @@ def synthetic_retrieval_step(
         "synth_router_top1_acc": float(losses["router_top1_acc"].item()),
         "synth_recall_at_m": float(losses["recall_at_m"].item()),
         "synth_pointer_acc": float(losses["pointer_acc"].item()),
+        "synth_fused_acc": float(losses["fused_acc"].item()),
     }
     return float(total.item()), metrics

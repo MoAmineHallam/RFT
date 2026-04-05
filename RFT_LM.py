@@ -397,7 +397,12 @@ class RFTMemoryLayer(nn.Module):
 
         # OCR scoring over the candidate set
         ocr_s = self._ocr_scores(q_tok, cand_vals, top_scores, recency_feat)  # [B, M]
+        # Inference-time retrieval weight (for metric only)
         attn_logits = top_scores + ocr_s                                       # [B, M]
+        # Training signal: OCR alone must rank target among top-M. If we add
+        # top_scores here, OCR can never reorder candidates — router dominates
+        # because ocr_alpha*ocr_s << top_scores in magnitude.
+        ptr_logits = ocr_s                                                     # [B, M]
 
         # Locate the target inside top-M (guaranteed by replacement above)
         target_pos_in_top = (top_idx == target_mem_idx.unsqueeze(1)).float().argmax(dim=1)  # [B]
@@ -407,12 +412,12 @@ class RFTMemoryLayer(nn.Module):
         # pull the target up before OCR can discriminate it.
         if target_in_top_nat.any():
             good_rows = target_in_top_nat.nonzero(as_tuple=True)[0]
-            al = attn_logits[good_rows]
+            pl = ptr_logits[good_rows]
             tp = target_pos_in_top[good_rows]
-            pointer_ce = F.cross_entropy(al, tp)
-            s_true_final = al.gather(1, tp.unsqueeze(1)).squeeze(1)
+            pointer_ce = F.cross_entropy(pl, tp)
+            s_true_final = pl.gather(1, tp.unsqueeze(1)).squeeze(1)
             nm = (top_idx[good_rows] != target_mem_idx[good_rows].unsqueeze(1))
-            s_neg = al.masked_fill(~nm, float("-inf"))
+            s_neg = pl.masked_fill(~nm, float("-inf"))
             s_hard = s_neg.max(dim=1).values
             ocr_contrastive = F.relu(ocr_margin - s_true_final + s_hard).mean()
         else:
@@ -423,7 +428,10 @@ class RFTMemoryLayer(nn.Module):
         with torch.no_grad():
             router_top1_correct = (scores.argmax(dim=-1) == target_mem_idx).float().mean()
             router_topm_hit = target_in_top_nat.float().mean()
-            pointer_correct = (attn_logits.argmax(dim=-1) == target_pos_in_top).float().mean()
+            # pointer_acc uses OCR-only ranking (what the loss actually trains)
+            pointer_correct = (ptr_logits.argmax(dim=-1) == target_pos_in_top).float().mean()
+            # fused_acc = what inference actually produces (router+OCR)
+            fused_correct = (attn_logits.argmax(dim=-1) == target_pos_in_top).float().mean()
 
         return {
             "router_ce": router_ce,
@@ -433,6 +441,7 @@ class RFTMemoryLayer(nn.Module):
             "router_top1_acc": router_top1_correct,
             "recall_at_m": router_topm_hit,
             "pointer_acc": pointer_correct,
+            "fused_acc": fused_correct,
         }
 
 

@@ -332,9 +332,10 @@ def train_rft_lm(
                     print(
                         f"  step {global_step:5d} | SYNTH loss {step_loss:.4f} | "
                         f"router_ce {synth_metrics['synth_router_ce']:.3f} | "
-                        f"ptr_ce {synth_metrics['synth_pointer_ce']:.3f} | "
-                        f"recall@M {synth_metrics['synth_recall_at_m']:.3f} | "
-                        f"ptr_acc {synth_metrics['synth_pointer_acc']:.3f} | "
+                        f"r@1 {synth_metrics['synth_router_top1_acc']:.3f} | "
+                        f"r@M {synth_metrics['synth_recall_at_m']:.3f} | "
+                        f"ptr {synth_metrics['synth_pointer_acc']:.3f} | "
+                        f"fused {synth_metrics['synth_fused_acc']:.3f} | "
                         f"ratio {cur_synth_ratio:.2f}",
                         flush=True,
                     )

@@ -97,8 +97,8 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--prompt_style", type=str, choices=["instruct", "continuation"],
                     default="continuation")
-    ap.add_argument("--value_type", type=str, choices=["numbers", "short_int", "uuids"],
-                    default="short_int")
+    ap.add_argument("--value_type", type=str, choices=["numbers", "short_int", "digit2", "uuids"],
+                    default="digit2")
     ap.add_argument("--mk_num_keys", type=int, default=3)
     ap.add_argument("--mk_num_queries", type=int, default=1)
     args = ap.parse_args()

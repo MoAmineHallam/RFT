@@ -61,6 +61,10 @@ def generate_value(rng: random.Random, value_type: str) -> str:
     if value_type == "short_int":
         # 3-digit int: usually tokenizes to 1 BPE piece with leading space in GPT-2
         return str(rng.randint(100, 999))
+    if value_type == "digit2":
+        # 2-digit int (10-99): reliably 1 BPE token with leading space in GPT-2.
+        # Means one correct token = full match, avoiding multi-token generation failure.
+        return str(rng.randint(10, 99))
     if value_type == "uuids":
         return str(uuid.UUID(int=rng.getrandbits(128), version=4))
     raise ValueError(f"Unsupported value_type={value_type}")

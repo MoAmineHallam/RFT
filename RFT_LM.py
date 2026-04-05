@@ -217,7 +217,7 @@ class RFTMemoryLayer(nn.Module):
 
         # Router scores
         q = self.router_q(x)  # [B, L, D]
-        scores = torch.einsum("bld,bnd->bln", q, memory_keys)  # [B, L, N_mem]
+        scores = torch.einsum("bld,bnd->bln", q, memory_keys) / math.sqrt(self.d_model)  # [B, L, N_mem]
 
         # Recency bias
         max_pos = max(current_pos_start + L - 1, 1)
@@ -292,7 +292,7 @@ class RFTMemoryLayer(nn.Module):
 
         # Router scores (same as forward)
         q = self.router_q(x)
-        scores = torch.einsum("bld,bnd->bln", q, memory_keys)
+        scores = torch.einsum("bld,bnd->bln", q, memory_keys) / math.sqrt(self.d_model)
         max_pos = max(current_pos_start + L - 1, 1)
         recency_all = memory_positions.float() / max_pos
         beta = self._router_beta(x)
@@ -355,8 +355,8 @@ class RFTMemoryLayer(nn.Module):
         q_tok = x[batch_idx, query_token_idx]               # [B, D]
         q = self.router_q(q_tok)                            # [B, D]
 
-        # Router scores over the full memory bank: [B, N_mem]
-        scores = torch.einsum("bd,bnd->bn", q, memory_keys)
+        # Router scores over the full memory bank: [B, N_mem], scaled like attention.
+        scores = torch.einsum("bd,bnd->bn", q, memory_keys) / math.sqrt(self.d_model)
         max_pos = max(current_pos_start + L - 1, 1)
         recency_all = memory_positions.float() / max_pos    # [B, N_mem]
         beta = self._router_beta(q_tok.unsqueeze(1)).squeeze(1)  # [B]
@@ -372,14 +372,16 @@ class RFTMemoryLayer(nn.Module):
         s_true = scores.gather(1, target_mem_idx.unsqueeze(1)).squeeze(1)
         topm_hinge = F.relu(cutoff - s_true + topm_margin).mean()
 
-        # Force target into candidate set so OCR can score it
-        top_scores, top_idx = torch.topk(scores, k=M, dim=-1)      # [B, M]
-        target_in_top = (top_idx == target_mem_idx.unsqueeze(1)).any(dim=1)
-        replace_mask = ~target_in_top
-        if replace_mask.any():
-            top_idx = top_idx.clone()
-            top_scores = top_scores.clone()
-            repl_rows = replace_mask.nonzero(as_tuple=True)[0]
+        # Natural top-M set (before any replacement) — used for honest recall@M
+        top_scores_nat, top_idx_nat = torch.topk(scores, k=M, dim=-1)    # [B, M]
+        target_in_top_nat = (top_idx_nat == target_mem_idx.unsqueeze(1)).any(dim=1)  # [B]
+
+        # Force target into candidate set at the correct (true) score so OCR can
+        # learn to rank it; do NOT demote it by keeping a stale lower score.
+        top_idx = top_idx_nat.clone()
+        top_scores = top_scores_nat.clone()
+        repl_rows = (~target_in_top_nat).nonzero(as_tuple=True)[0]
+        if repl_rows.numel() > 0:
             top_idx[repl_rows, -1] = target_mem_idx[repl_rows]
             top_scores[repl_rows, -1] = scores[repl_rows].gather(
                 1, target_mem_idx[repl_rows].unsqueeze(1)
@@ -400,20 +402,27 @@ class RFTMemoryLayer(nn.Module):
         # Locate the target inside top-M (guaranteed by replacement above)
         target_pos_in_top = (top_idx == target_mem_idx.unsqueeze(1)).float().argmax(dim=1)  # [B]
 
-        # (3) Pointer CE: softmax over top-M candidates
-        pointer_ce = F.cross_entropy(attn_logits, target_pos_in_top)
+        # Pointer CE and OCR contrastive: only meaningful on rows where the
+        # target was NATURALLY in top-M — otherwise the top-M hinge must first
+        # pull the target up before OCR can discriminate it.
+        if target_in_top_nat.any():
+            good_rows = target_in_top_nat.nonzero(as_tuple=True)[0]
+            al = attn_logits[good_rows]
+            tp = target_pos_in_top[good_rows]
+            pointer_ce = F.cross_entropy(al, tp)
+            s_true_final = al.gather(1, tp.unsqueeze(1)).squeeze(1)
+            nm = (top_idx[good_rows] != target_mem_idx[good_rows].unsqueeze(1))
+            s_neg = al.masked_fill(~nm, float("-inf"))
+            s_hard = s_neg.max(dim=1).values
+            ocr_contrastive = F.relu(ocr_margin - s_true_final + s_hard).mean()
+        else:
+            pointer_ce = torch.tensor(0.0, device=device)
+            ocr_contrastive = torch.tensor(0.0, device=device)
 
-        # (4) OCR contrastive hinge: target beats the hardest negative
-        s_true_final = attn_logits.gather(1, target_pos_in_top.unsqueeze(1)).squeeze(1)
-        neg_mask = (top_idx != target_mem_idx.unsqueeze(1))
-        s_neg = attn_logits.masked_fill(~neg_mask, float("-inf"))
-        s_hard = s_neg.max(dim=1).values
-        ocr_contrastive = F.relu(ocr_margin - s_true_final + s_hard).mean()
-
-        # Accuracy metrics (for logging)
+        # Accuracy metrics (for logging) — honest, computed on natural top-M
         with torch.no_grad():
             router_top1_correct = (scores.argmax(dim=-1) == target_mem_idx).float().mean()
-            router_topm_hit = (top_idx == target_mem_idx.unsqueeze(1)).any(dim=1).float().mean()
+            router_topm_hit = target_in_top_nat.float().mean()
             pointer_correct = (attn_logits.argmax(dim=-1) == target_pos_in_top).float().mean()
 
         return {

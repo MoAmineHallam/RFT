@@ -245,27 +245,37 @@ def niah_retrieval_step(
         lm_acc = (lm_pred == target_token_ids).float().mean()
 
     # ── Memory decode loss (shortcut) ────────────────────────────────
-    # The LM loss gradient must traverse layers 7-11 to reach mem_ctx,
-    # which is too diluted to learn from.  This auxiliary loss creates a
-    # direct path:  decode_loss → lm_head → ln_f → mem_ctx → mem_val_proj.
-    # It teaches mem_val_proj to produce representations that the output
-    # head can directly decode into the correct value token.
-    decode_loss = torch.tensor(0.0, device=logits.device)
-    if mem_ctx is not None:
-        # Extract retrieved memory at query position
-        retrieved_at_q = mem_ctx[batch_idx, query_token_idx]  # [B, D]
-        # Also grab the pre-memory hidden state and ADD the mem_ctx
-        # (simulate what the output head "sees" if layers 7-11 were identity)
-        base_hidden = x_at_mem[batch_idx, query_token_idx]  # [B, D]
-        combined = base_hidden + retrieved_at_q                # [B, D]
-        decode_logits = model.lm_head(model.ln_f(combined.unsqueeze(1))).squeeze(1)  # [B, V]
-        decode_loss = F.cross_entropy(decode_logits, target_token_ids)
+    # Problem: lm_head expects layer-12 output but mem_ctx comes from
+    # layer-6 → different representation space → can't decode directly.
+    #
+    # Fix: train mem_val_proj to produce vectors ALIGNED with the target
+    # token's embedding.  Since lm_head.weight = embed.weight (tied),
+    # if mem_val ≈ embed(42), then the residual addition x + mem_ctx
+    # naturally boosts the logit for token 42.
+    #
+    # Gradient path: embed_loss → cosine_sim → mem_val → mem_val_proj
+    #   → chunk0 hidden states.  Very short, no layer 7-11 bottleneck.
+    embed_loss = torch.tensor(0.0, device=logits.device)
+    embed_acc = torch.tensor(0.0, device=logits.device)
+    if mem_v is not None:
+        # Raw memory value at the target position
+        target_val = mem_v[batch_idx, target_mem_idx]          # [B, D]
+        # Target token embedding
+        target_embed = model.embed.weight[target_token_ids]    # [B, D]
+
+        # Cosine alignment loss
+        cos_sim = F.cosine_similarity(target_val, target_embed, dim=-1)  # [B]
+        embed_loss = (1.0 - cos_sim).mean()
+
+        # Also add a softmax cross-entropy through the embedding matrix
+        # so the gradient directly shapes mem_val_proj to peak at the right token.
+        val_logits = torch.matmul(target_val, model.embed.weight.T)  # [B, vocab]
+        embed_ce = F.cross_entropy(val_logits, target_token_ids)
+        embed_loss = embed_loss + embed_ce
 
         with torch.no_grad():
-            decode_pred = decode_logits.argmax(dim=-1)
-            decode_acc = (decode_pred == target_token_ids).float().mean()
-    else:
-        decode_acc = torch.tensor(0.0)
+            embed_pred = val_logits.argmax(dim=-1)
+            embed_acc = (embed_pred == target_token_ids).float().mean()
 
     # ── Supervised retrieval loss ────────────────────────────────────
     ret = model.memory_layer.supervised_retrieval_loss(
@@ -281,7 +291,7 @@ def niah_retrieval_step(
     # ── Combined loss ────────────────────────────────────────────────
     total = (
         loss_weights.get("lm_ce", 1.0) * lm_loss
-        + loss_weights.get("decode", 5.0) * decode_loss
+        + loss_weights.get("decode", 5.0) * embed_loss
         + loss_weights.get("router_ce", 1.0) * ret["router_ce"]
         + loss_weights.get("topm_hinge", 0.25) * ret["topm_hinge"]
         + loss_weights.get("pointer_ce", 0.5) * ret["pointer_ce"]
@@ -295,8 +305,8 @@ def niah_retrieval_step(
         "niah_loss": float(total.item()),
         "niah_lm_ce": float(lm_loss.item()),
         "niah_lm_acc": float(lm_acc.item()),
-        "niah_decode_ce": float(decode_loss.item()),
-        "niah_decode_acc": float(decode_acc.item()),
+        "niah_embed_loss": float(embed_loss.item()),
+        "niah_embed_acc": float(embed_acc.item()),
         "niah_router_ce": float(ret["router_ce"].item()),
         "niah_topm_hinge": float(ret["topm_hinge"].item()),
         "niah_recall_at_m": float(ret["recall_at_m"].item()),

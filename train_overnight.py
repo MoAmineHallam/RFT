@@ -405,8 +405,8 @@ def train_rft_lm(
                     print(
                         f"  step {global_step:5d} | NIAH loss {step_loss:.4f} | "
                         f"lm_acc {niah_metrics['niah_lm_acc']:.3f} | "
-                        f"dec_acc {niah_metrics['niah_decode_acc']:.3f} | "
-                        f"dec_ce {niah_metrics['niah_decode_ce']:.3f} | "
+                        f"emb_acc {niah_metrics['niah_embed_acc']:.3f} | "
+                        f"emb_loss {niah_metrics['niah_embed_loss']:.3f} | "
                         f"r@M {niah_metrics['niah_recall_at_m']:.3f} | "
                         f"fused {niah_metrics['niah_fused_acc']:.3f}",
                         flush=True,

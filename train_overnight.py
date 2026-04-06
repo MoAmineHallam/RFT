@@ -230,6 +230,23 @@ def train_rft_lm(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_schedule)
 
+    # Resume from checkpoint if specified
+    resume_step = 0
+    if args.resume_from:
+        ckpt = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+        sd = ckpt["model"]
+        if any(k.startswith("module.") for k in sd):
+            sd = {k.replace("module.", ""): v for k, v in sd.items()}
+        raw_m = model.module if world_size > 1 else model
+        raw_m.load_state_dict(sd, strict=False)
+        if "optimizer" in ckpt:
+            opt.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        resume_step = ckpt.get("step", 0)
+        if is_main:
+            print(f"[RESUME] Loaded checkpoint from {args.resume_from} (step={resume_step})")
+
     # Training
     if is_main:
         print(f"\n[TRAIN] epochs={args.epochs}, steps/epoch={len(dataloader)}, "
@@ -684,6 +701,10 @@ def main():
                     help="DataLoader worker processes.")
     ap.add_argument("--seed", type=int, default=42)
     
+    # Checkpoint resumption
+    ap.add_argument("--resume_from", type=str, default=None,
+                    help="Path to checkpoint .pt to resume from (loads model + optimizer).")
+
     # DDP
     ap.add_argument("--n_gpus", type=int, default=1)
 

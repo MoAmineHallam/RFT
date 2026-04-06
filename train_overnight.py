@@ -291,6 +291,7 @@ def train_rft_lm(
     niah_gen = None
     niah_loss_weights = {
         "lm_ce": args.niah_lm_w,
+        "decode": args.niah_decode_w,
         "router_ce": args.niah_router_w,
         "topm_hinge": args.niah_topm_w,
         "pointer_ce": args.niah_pointer_w,
@@ -330,8 +331,9 @@ def train_rft_lm(
             print(f"[NIAH] natural-language NIAH ON: ratio {args.niah_ratio:.2f}->"
                   f"{args.niah_ratio_end:.2f}, bs={args.niah_batch_size} "
                   f"needles={args.niah_num_needles} dist_toks={len(niah_dist_tokens):,}")
-            print(f"[NIAH] loss weights: lm={args.niah_lm_w} router={args.niah_router_w} "
-                  f"topm={args.niah_topm_w} ptr={args.niah_pointer_w} ocr={args.niah_ocr_w}")
+            print(f"[NIAH] loss weights: lm={args.niah_lm_w} decode={args.niah_decode_w} "
+                  f"router={args.niah_router_w} topm={args.niah_topm_w} "
+                  f"ptr={args.niah_pointer_w} ocr={args.niah_ocr_w}")
 
     rng_synth = random.Random(args.seed + 1000 + rank)
 
@@ -402,10 +404,10 @@ def train_rft_lm(
                 if is_main and (global_step % log_interval == 0 or global_step == 1):
                     print(
                         f"  step {global_step:5d} | NIAH loss {step_loss:.4f} | "
-                        f"lm_ce {niah_metrics['niah_lm_ce']:.3f} | "
                         f"lm_acc {niah_metrics['niah_lm_acc']:.3f} | "
+                        f"dec_acc {niah_metrics['niah_decode_acc']:.3f} | "
+                        f"dec_ce {niah_metrics['niah_decode_ce']:.3f} | "
                         f"r@M {niah_metrics['niah_recall_at_m']:.3f} | "
-                        f"ptr {niah_metrics['niah_pointer_acc']:.3f} | "
                         f"fused {niah_metrics['niah_fused_acc']:.3f}",
                         flush=True,
                     )
@@ -679,6 +681,8 @@ def main():
     ap.add_argument("--niah_num_needles", type=int, default=3)
     ap.add_argument("--niah_lm_w", type=float, default=2.0,
                     help="Weight for LM loss at probe position in NIAH steps.")
+    ap.add_argument("--niah_decode_w", type=float, default=5.0,
+                    help="Weight for direct memory-decode shortcut loss.")
     ap.add_argument("--niah_router_w", type=float, default=1.0)
     ap.add_argument("--niah_topm_w", type=float, default=0.25)
     ap.add_argument("--niah_pointer_w", type=float, default=0.5)

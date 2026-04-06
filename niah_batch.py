@@ -221,6 +221,7 @@ def niah_retrieval_step(
     rope_cos, rope_sin = model.rope(L1, offset=L0)
 
     x_at_mem = None
+    mem_ctx = None
     for i, layer in enumerate(model.layers):
         x = layer(x, rope_cos, rope_sin, L0)
         if i == model.memory_layer_idx:
@@ -243,6 +244,29 @@ def niah_retrieval_step(
         lm_pred = query_logits.argmax(dim=-1)
         lm_acc = (lm_pred == target_token_ids).float().mean()
 
+    # ── Memory decode loss (shortcut) ────────────────────────────────
+    # The LM loss gradient must traverse layers 7-11 to reach mem_ctx,
+    # which is too diluted to learn from.  This auxiliary loss creates a
+    # direct path:  decode_loss → lm_head → ln_f → mem_ctx → mem_val_proj.
+    # It teaches mem_val_proj to produce representations that the output
+    # head can directly decode into the correct value token.
+    decode_loss = torch.tensor(0.0, device=logits.device)
+    if mem_ctx is not None:
+        # Extract retrieved memory at query position
+        retrieved_at_q = mem_ctx[batch_idx, query_token_idx]  # [B, D]
+        # Also grab the pre-memory hidden state and ADD the mem_ctx
+        # (simulate what the output head "sees" if layers 7-11 were identity)
+        base_hidden = x_at_mem[batch_idx, query_token_idx]  # [B, D]
+        combined = base_hidden + retrieved_at_q                # [B, D]
+        decode_logits = model.lm_head(model.ln_f(combined.unsqueeze(1))).squeeze(1)  # [B, V]
+        decode_loss = F.cross_entropy(decode_logits, target_token_ids)
+
+        with torch.no_grad():
+            decode_pred = decode_logits.argmax(dim=-1)
+            decode_acc = (decode_pred == target_token_ids).float().mean()
+    else:
+        decode_acc = torch.tensor(0.0)
+
     # ── Supervised retrieval loss ────────────────────────────────────
     ret = model.memory_layer.supervised_retrieval_loss(
         x_at_mem,
@@ -257,6 +281,7 @@ def niah_retrieval_step(
     # ── Combined loss ────────────────────────────────────────────────
     total = (
         loss_weights.get("lm_ce", 1.0) * lm_loss
+        + loss_weights.get("decode", 5.0) * decode_loss
         + loss_weights.get("router_ce", 1.0) * ret["router_ce"]
         + loss_weights.get("topm_hinge", 0.25) * ret["topm_hinge"]
         + loss_weights.get("pointer_ce", 0.5) * ret["pointer_ce"]
@@ -270,6 +295,8 @@ def niah_retrieval_step(
         "niah_loss": float(total.item()),
         "niah_lm_ce": float(lm_loss.item()),
         "niah_lm_acc": float(lm_acc.item()),
+        "niah_decode_ce": float(decode_loss.item()),
+        "niah_decode_acc": float(decode_acc.item()),
         "niah_router_ce": float(ret["router_ce"].item()),
         "niah_topm_hinge": float(ret["topm_hinge"].item()),
         "niah_recall_at_m": float(ret["recall_at_m"].item()),

@@ -547,6 +547,7 @@ class RFTLM(nn.Module):
         return_memory_state: bool = False,
         compute_ocr_loss: bool = False,
         ocr_margin: float = 0.10,
+        detach_memory: bool = True,
     ) -> dict:
         B, L = input_ids.shape
         D = self.d_model
@@ -567,8 +568,9 @@ class RFTLM(nn.Module):
             if (i == self.memory_layer_idx) and self.use_memory:
                 # Generate memory entries from current hidden state
                 if return_memory_state:
-                    new_mem_keys = self.mem_key_proj(x.detach())  # [B, L, D]
-                    new_mem_vals = self.mem_val_proj(x.detach())  # [B, L, D]
+                    x_mem = x.detach() if detach_memory else x
+                    new_mem_keys = self.mem_key_proj(x_mem)  # [B, L, D]
+                    new_mem_vals = self.mem_val_proj(x_mem)  # [B, L, D]
 
                 # Retrieve from memory if available
                 if memory_keys is not None and memory_keys.shape[1] > 0:

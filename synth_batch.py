@@ -115,18 +115,22 @@ def synthetic_retrieval_step(
 
     memory_bank = MemoryBank(max_entries=L0)
 
-    # Chunk 0: populate memory bank (no gradient)
-    with torch.no_grad():
-        out0 = raw_model(
-            pairs_chunk,
-            memory_keys=None, memory_vals=None, memory_positions=None,
-            pos_offset=0,
-            return_memory_state=True,
-            compute_ocr_loss=False,
-        )
+    # Chunk 0: populate memory bank WITH gradients so that mem_key_proj,
+    # mem_val_proj, and the shared transformer layers all receive gradient
+    # signal from the supervised retrieval loss. Without this, only router_q
+    # gets gradient — memory keys/vals are frozen random projections and the
+    # router can never converge (as observed in v1/v2 pilots).
+    out0 = raw_model(
+        pairs_chunk,
+        memory_keys=None, memory_vals=None, memory_positions=None,
+        pos_offset=0,
+        return_memory_state=True,
+        compute_ocr_loss=False,
+        detach_memory=False,  # keep gradient graph alive
+    )
     memory_bank.add(
-        out0["new_mem_keys"].detach(),
-        out0["new_mem_vals"].detach(),
+        out0["new_mem_keys"],   # NOT detached
+        out0["new_mem_vals"],   # NOT detached
         0, L0,
     )
     mem_k, mem_v, mem_pos = memory_bank.get_state()

@@ -45,6 +45,7 @@ from RFT_LM import (
     train_step_chunked,
 )
 from synth_batch import SynthBatchConfig, SyntheticKVBatchGen, synthetic_retrieval_step
+from niah_batch import NIAHBatchConfig, NIAHBatchGen, niah_retrieval_step
 
 
 # ─────────────────────────────────────────────
@@ -268,6 +269,53 @@ def train_rft_lm(
             print(f"[SYNTH] loss weights: router={args.synth_router_w} topm={args.synth_topm_w} "
                   f"ptr={args.synth_pointer_w} ocr={args.synth_ocr_w} scale={args.synth_loss_scale}")
 
+    # NIAH natural-language retrieval batch generator
+    use_niah = is_rft_variant and use_memory and args.model == "rft_lm" and args.niah_ratio > 0
+    niah_gen = None
+    niah_loss_weights = {
+        "lm_ce": args.niah_lm_w,
+        "router_ce": args.niah_router_w,
+        "topm_hinge": args.niah_topm_w,
+        "pointer_ce": args.niah_pointer_w,
+        "ocr_contrastive": args.niah_ocr_w,
+    }
+    if use_niah:
+        # Load tokenizer and distractor tokens for NIAH batches
+        from transformers import AutoTokenizer as _AT
+        niah_tokenizer = _AT.from_pretrained(
+            args.tokenizer_path or "gpt2", use_fast=True
+        )
+        niah_tokenizer.model_max_length = 10**9
+
+        # Load distractor tokens from C4 data
+        import json as _json
+        _niah_texts = []
+        with open(args.data_path, "r", encoding="utf-8") as _f:
+            for _i, _line in enumerate(_f):
+                if _i >= args.niah_distractor_docs:
+                    break
+                _niah_texts.append(_json.loads(_line).get("text", ""))
+        niah_dist_tokens = niah_tokenizer.encode(
+            " ".join(_niah_texts), add_special_tokens=False
+        )
+
+        niah_cfg = NIAHBatchConfig(
+            chunk_size=args.chunk_size,
+            batch_size=args.niah_batch_size,
+            num_needles=args.niah_num_needles,
+            value_type="digit2",
+        )
+        niah_gen = NIAHBatchGen(
+            niah_cfg, niah_tokenizer, niah_dist_tokens,
+            device=device, seed=args.seed + 2000 + rank,
+        )
+        if is_main:
+            print(f"[NIAH] natural-language NIAH ON: ratio {args.niah_ratio:.2f}->"
+                  f"{args.niah_ratio_end:.2f}, bs={args.niah_batch_size} "
+                  f"needles={args.niah_num_needles} dist_toks={len(niah_dist_tokens):,}")
+            print(f"[NIAH] loss weights: lm={args.niah_lm_w} router={args.niah_router_w} "
+                  f"topm={args.niah_topm_w} ptr={args.niah_pointer_w} ocr={args.niah_ocr_w}")
+
     rng_synth = random.Random(args.seed + 1000 + rank)
 
     global_step = 0
@@ -302,13 +350,58 @@ def train_rft_lm(
 
             opt.zero_grad()
 
-            # Decide whether this step is a synthetic-retrieval step
+            # Decide step type: NIAH / synthetic / C4
+            progress = global_step / max(total_steps, 1)
             if use_synth:
-                progress = global_step / max(total_steps, 1)
                 cur_synth_ratio = args.synth_ratio + progress * (args.synth_ratio_end - args.synth_ratio)
             else:
                 cur_synth_ratio = 0.0
-            do_synth_step = use_synth and (rng_synth.random() < cur_synth_ratio)
+            if use_niah:
+                cur_niah_ratio = args.niah_ratio + progress * (args.niah_ratio_end - args.niah_ratio)
+            else:
+                cur_niah_ratio = 0.0
+
+            r = rng_synth.random()
+            do_niah_step = use_niah and (r < cur_niah_ratio)
+            do_synth_step = (not do_niah_step) and use_synth and (r < cur_niah_ratio + cur_synth_ratio)
+
+            if do_niah_step:
+                niah_batch = next(niah_gen)
+                scaled_nw = {k: v * args.niah_loss_scale for k, v in niah_loss_weights.items()}
+                _, niah_metrics = niah_retrieval_step(
+                    raw_model, niah_batch, scaled_nw, do_backward=True,
+                )
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                scheduler.step()
+
+                step_loss = niah_metrics["niah_loss"]
+                metrics = {"loss": step_loss, "is_niah": 1.0, **niah_metrics}
+                epoch_loss += step_loss
+                epoch_tokens += args.niah_batch_size * args.chunk_size * 2
+                global_step += 1
+                all_losses.append(step_loss)
+
+                if is_main and (global_step % log_interval == 0 or global_step == 1):
+                    print(
+                        f"  step {global_step:5d} | NIAH loss {step_loss:.4f} | "
+                        f"lm_ce {niah_metrics['niah_lm_ce']:.3f} | "
+                        f"lm_acc {niah_metrics['niah_lm_acc']:.3f} | "
+                        f"r@M {niah_metrics['niah_recall_at_m']:.3f} | "
+                        f"ptr {niah_metrics['niah_pointer_acc']:.3f} | "
+                        f"fused {niah_metrics['niah_fused_acc']:.3f}",
+                        flush=True,
+                    )
+                    record = {
+                        "step": int(global_step),
+                        "is_niah": 1,
+                        "loss": float(step_loss),
+                        **{k: float(v) for k, v in niah_metrics.items()},
+                        "niah_ratio": float(cur_niah_ratio),
+                    }
+                    with open(metrics_path, "a") as f:
+                        f.write(json.dumps(record) + "\n")
+                continue
 
             if do_synth_step:
                 synth_batch = next(synth_gen)
@@ -558,6 +651,23 @@ def main():
     ap.add_argument("--synth_topm_w", type=float, default=0.25)
     ap.add_argument("--synth_pointer_w", type=float, default=0.5)
     ap.add_argument("--synth_ocr_w", type=float, default=0.2)
+
+    # NIAH-format natural-language retrieval supervision
+    ap.add_argument("--niah_ratio", type=float, default=0.15,
+                    help="Probability of a NIAH-format step (natural language needles).")
+    ap.add_argument("--niah_ratio_end", type=float, default=0.10,
+                    help="niah_ratio anneals linearly to this value.")
+    ap.add_argument("--niah_loss_scale", type=float, default=1.0)
+    ap.add_argument("--niah_batch_size", type=int, default=4)
+    ap.add_argument("--niah_num_needles", type=int, default=3)
+    ap.add_argument("--niah_lm_w", type=float, default=2.0,
+                    help="Weight for LM loss at probe position in NIAH steps.")
+    ap.add_argument("--niah_router_w", type=float, default=1.0)
+    ap.add_argument("--niah_topm_w", type=float, default=0.25)
+    ap.add_argument("--niah_pointer_w", type=float, default=0.5)
+    ap.add_argument("--niah_ocr_w", type=float, default=0.2)
+    ap.add_argument("--niah_distractor_docs", type=int, default=200,
+                    help="Number of C4 documents to use as NIAH distractors.")
 
     # Training config
     ap.add_argument("--total_seq_len", type=int, default=2048)

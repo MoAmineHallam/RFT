@@ -258,11 +258,48 @@ embed_loss = embed_loss + embed_ce
 
 ---
 
-## 7) Git Status
+## 7) New Scripts Added (April 9)
+
+### Evaluation Pipeline
+
+| Script | Purpose |
+|--------|---------|
+| `run_eval_v4b.sh` | **Priority 1**: RULER S-NIAH eval on v4b checkpoint. Sanity check → full depth sweep → ablation (disable_memory, disable_ocr). |
+| `run_eval_multi_seed.sh` | Eval across all multi-seed retrain checkpoints. Produces per-(seed, variant) JSONs. |
+| `aggregate_results.py` | Parses eval JSONs → paper tables (mean±std across seeds), CSV, LaTeX. |
+
+### Training Pipeline
+
+| Script | Purpose |
+|--------|---------|
+| `run_multi_seed_v4b.sh` | 3 seeds × 4 variants, 2-phase training (Phase 1: C4+synth, Phase 2: +NIAH curriculum). |
+
+### Code Fixes
+
+- `eval_ruler_niah.py`: Added `model.eval()` calls to `load_rft_model` and `load_baseline_model` (robustness).
+
+### Execution Order
+
+1. **Run `run_eval_v4b.sh`** — if v4b ≥ 50% at 2K, proceed
+2. **Run `run_multi_seed_v4b.sh`** — 3 seeds × 4 variants retraining
+3. **Run `run_eval_multi_seed.sh`** — eval all checkpoints
+4. **Run `aggregate_results.py`** — paper tables
+
+### Key Analysis Findings
+
+- **First-token prediction in eval matches training**: For digit2 values, the answer is 1 BPE token. `generate_greedy` uses logits from the last prompt chunk (with full 512-token window + memory), identical to training-time prediction. This suggests v4b's 75% training lm_acc should transfer to eval.
+- **Memory bank size at eval differs from training**: Training: 512 entries. Eval at 2K: ~1536. At 8K: ~7680. Since recall@M=1.000, routing should still work, but worth monitoring.
+- **Baseline comparison is inherently fair**: Both models trained chunk-by-chunk. Baseline has no cross-chunk mechanism — this IS the point of the paper.
+- **Prior 0% eval was on pre-NIAH checkpoints (April 4 matched retrains)**, not v4b. Those models never saw NIAH training.
+
+---
+
+## 8) Git Status
 
 - **Remote**: `git@github.com:MoAmineHallam/RFT.git`
-- **Branch**: `claude/analyze-repo-improvements-4sYcD`
-- Key code (niah_batch.py, train_overnight.py updates) is committed to this branch
+- **Development branch**: `claude/analyze-rft-lm-improvements-2TaaA`
+- **Previous branch**: `claude/analyze-repo-improvements-4sYcD` (niah_batch.py, train_overnight.py)
+- Key scripts committed on both branches
 
 ---
 

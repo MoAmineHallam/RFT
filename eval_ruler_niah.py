@@ -338,6 +338,7 @@ def load_rft_model(path: str, device: torch.device) -> RFTLM:
     if any(k.startswith("module.") for k in sd):
         sd = {k.replace("module.", ""): v for k, v in sd.items()}
     model.load_state_dict(sd, strict=False)
+    model.eval()
     return model
 
 
@@ -357,6 +358,7 @@ def load_baseline_model(path: str, device: torch.device) -> BaselineTransformerL
     if any(k.startswith("module.") for k in sd):
         sd = {k.replace("module.", ""): v for k, v in sd.items()}
     model.load_state_dict(sd, strict=False)
+    model.eval()
     return model
 
 

@@ -255,7 +255,7 @@ for seed in "${SEEDS[@]}"; do
       echo "FAIL ppl eval seed=$seed variant=$variant" | tee -a "$ERRORS" "$RUNBOOK"
     fi
     # eval_perplexity writes to rft_ckpt_dir/../outfile
-    src_ppl="$sdir/$variant/../ppl_${variant}_seed${seed}.json"
+    src_ppl="$sdir/ppl_${variant}_seed${seed}.json"
     if [ -f "$src_ppl" ]; then mv "$src_ppl" "$edir/"; fi
 
     echo "[EVAL_NIAH] seed=$seed variant=$variant" | tee -a "$RUNBOOK"
@@ -282,6 +282,9 @@ for seed in "${SEEDS[@]}"; do
 done
 
 # Aggregate with confidence intervals and go/no-go verdict
+RFT_VARIANTS_CSV="$(IFS=,; echo "${RFT_VARIANTS[*]}")"
+ALL_VARIANTS_CSV="baseline,${RFT_VARIANTS_CSV}"
+
 run_py - <<PY
 import glob, json, math, os, statistics
 from pathlib import Path
@@ -290,8 +293,8 @@ eval_root = Path("$EVAL_ROOT")
 out_json = eval_root / "aggregated_summary.json"
 out_md = eval_root / "go_no_go.md"
 seq_lens = ["2048", "4096", "8192"]
-variants = ["baseline", "rft_lm", "rft_lm_disable_memory", "rft_lm_disable_ocr"]
-rft_variants = ["rft_lm", "rft_lm_disable_memory", "rft_lm_disable_ocr"]
+variants = "$ALL_VARIANTS_CSV".split(",")
+rft_variants = "$RFT_VARIANTS_CSV".split(",")
 
 def ci95(vals):
     if not vals:

@@ -244,31 +244,39 @@ def niah_retrieval_step(
         lm_pred = query_logits.argmax(dim=-1)
         lm_acc = (lm_pred == target_token_ids).float().mean()
 
-    # ── Memory decode loss (shortcut) ────────────────────────────────
-    # Problem: lm_head expects layer-12 output but mem_ctx comes from
-    # layer-6 → different representation space → can't decode directly.
+    # ── Memory decode loss (embedding alignment) ──────────────────────
     #
-    # Fix: train mem_val_proj to produce vectors ALIGNED with the target
+    # Train the FULL memory-to-output pipeline so that the context vector
+    # actually added to the residual stream is aligned with the target
     # token's embedding.  Since lm_head.weight = embed.weight (tied),
-    # if mem_val ≈ embed(42), then the residual addition x + mem_ctx
-    # naturally boosts the logit for token 42.
+    # if mem_ctx ≈ embed(42), the residual x + mem_ctx boosts logit 42.
     #
-    # Gradient path: embed_loss → cosine_sim → mem_val → mem_val_proj
-    #   → chunk0 hidden states.  Very short, no layer 7-11 bottleneck.
+    # CRITICAL: We use mem_ctx at the query position (post gate/ln/proj/
+    # scale) — NOT raw mem_v.  The previous version trained only
+    # mem_val_proj to align raw mem_v with embeddings, but at eval time
+    # mem_v goes through gate → LayerNorm → out_proj → tanh(α) scaling,
+    # which destroyed the alignment.  Training through the full transform
+    # ensures gate, mem_ln, out_proj, and mem_gate_alpha all learn to
+    # preserve the embedding alignment signal.
+    #
+    # Gradient path: embed_loss → mem_ctx → memory_layer.forward()
+    #   → (gate, mem_ln, out_proj, mem_gate_alpha, attn_weights,
+    #      OCR, router) → mem_val_proj → chunk0 hidden states.
     embed_loss = torch.tensor(0.0, device=logits.device)
     embed_acc = torch.tensor(0.0, device=logits.device)
-    if mem_v is not None:
-        # Raw memory value at the target position
-        target_val = mem_v[batch_idx, target_mem_idx]          # [B, D]
+    if mem_ctx is not None:
+        # Post-transform memory context at the query position — this is
+        # exactly what gets added to the residual stream at eval time.
+        target_val = mem_ctx[batch_idx, query_token_idx]      # [B, D]
         # Target token embedding
-        target_embed = model.embed.weight[target_token_ids]    # [B, D]
+        target_embed = model.embed.weight[target_token_ids]   # [B, D]
 
-        # Cosine alignment loss
+        # Cosine alignment loss (scale-invariant, works despite tanh scaling)
         cos_sim = F.cosine_similarity(target_val, target_embed, dim=-1)  # [B]
         embed_loss = (1.0 - cos_sim).mean()
 
-        # Also add a softmax cross-entropy through the embedding matrix
-        # so the gradient directly shapes mem_val_proj to peak at the right token.
+        # CE through embedding matrix — gradient flows through the full
+        # memory layer pipeline, training gate/ln/out_proj/scale together.
         val_logits = torch.matmul(target_val, model.embed.weight.T)  # [B, vocab]
         embed_ce = F.cross_entropy(val_logits, target_token_ids)
         embed_loss = embed_loss + embed_ce

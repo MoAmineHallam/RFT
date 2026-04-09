@@ -54,7 +54,10 @@ echo "[EVAL_V4B] Baseline:  $BASELINE_CKPT"
 # ── Step 1: Quick sanity (10 trials, short context) ──────────────────
 echo ""
 echo "================================================================"
-echo "  STEP 1: Sanity check (seq=512, depth=1.0, 10 trials)"
+echo "  STEP 1: Sanity check (seq=1024, depth=0.5, 10 trials)"
+echo "  NOTE: seq_len MUST be >= 2*chunk_size so that chunk 0 populates"
+echo "  memory and chunk 1 retrieves from it. With seq=512=chunk_size,"
+echo "  memory is empty and retrieval is impossible."
 echo "================================================================"
 
 python "$SCRIPT_DIR/niah_sanity.py" \
@@ -62,8 +65,8 @@ python "$SCRIPT_DIR/niah_sanity.py" \
     --baseline_ckpt "$BASELINE_CKPT" \
     --tokenizer_path "$TOK" \
     --distractor_path "$DISTRACTOR" \
-    --seq_len 512 \
-    --depth 1.0 \
+    --seq_len 1024 \
+    --depth 0.5 \
     --n_trials 10 \
     --max_new_tokens 5 \
     --chunk_size 512 \

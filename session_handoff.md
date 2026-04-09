@@ -103,6 +103,8 @@ Resumed from pilot v3 checkpoint, trained 5960 additional steps with:
 
 **This is the core breakthrough**: the embedding alignment loss solved the "memory-to-output gap" where the model could retrieve correctly but couldn't generate the retrieved value.
 
+**⚠ CRITICAL BUG FOUND (April 9)**: The v4b embedding alignment loss trained on **raw `mem_v`** (output of `mem_val_proj`), but at eval time, `mem_v` goes through `gate → LayerNorm → out_proj → tanh(0.1) scaling` before being added to the residual stream. These transforms destroy the alignment, explaining why v4b achieves 0% on RULER S-NIAH despite 75% training lm_acc. See Section 3 for details and the fix.
+
 ---
 
 ## 3) The Memory-to-Output Gap (Key Technical Challenge)
@@ -119,25 +121,43 @@ Memory is retrieved at layer 6 and added as a residual: `x = x + tanh(alpha) * m
 1. **LM loss alone** (pilot v4, 298 steps): lm_acc stuck at 0.000 — gradient from single-position CE loss is too diluted by the time it reaches `mem_val_proj` through 6 transformer layers
 2. **Decode shortcut loss** (pilot with decode): `CE(lm_head(ln_f(base_hidden + mem_ctx)), target)` — dec_acc stuck at 0.000 because `ln_f + lm_head` expect layer-12 representations, not layer-6
 
-### The Fix That Worked
+### v4b Approach (Partial Fix)
 
-**Embedding alignment loss** (pilot v4b): Instead of routing through layers 7-11, directly train `mem_val_proj` to output vectors that look like the target token's embedding:
+**Embedding alignment loss** (pilot v4b): Train `mem_val_proj` to output vectors that look like the target token's embedding:
 
 ```python
 target_val = mem_v[batch_idx, target_mem_idx]       # [B, D] — raw memory value
-target_embed = model.embed.weight[target_token_ids]  # [B, D] — target token embedding
-
-# Cosine alignment
-cos_sim = F.cosine_similarity(target_val, target_embed, dim=-1)
-embed_loss = (1.0 - cos_sim).mean()
-
-# Plus CE through embedding matrix for sharper gradient
-val_logits = torch.matmul(target_val, model.embed.weight.T)
-embed_ce = F.cross_entropy(val_logits, target_token_ids)
-embed_loss = embed_loss + embed_ce
+embed_loss = cosine + CE(target_val @ embed.weight.T, target_token)
 ```
 
-**Why it works**: Since `lm_head.weight = embed.weight` (tied weights), if `mem_val ≈ embed(token_42)`, then the residual addition `x + mem_ctx` naturally boosts logit for token 42. The gradient path is short: `embed_loss → cosine_sim → mem_val → mem_val_proj`, bypassing the layer 7-11 bottleneck entirely.
+**Why it partially worked**: During training, the LM loss at the probe position goes through the FULL pipeline (mem_ctx → layers 7-11 → lm_head) and achieved 75% accuracy. But the embedding alignment loss gradient bypassed gate/ln/out_proj/scale, so those components were NOT trained to preserve alignment.
+
+### v4b Bug: Why emb_acc=1.0 but eval=0%
+
+The embedding alignment loss operated on **raw `mem_v`** (before any transforms). At eval, the model uses the full `RFTMemoryLayer.forward()`, which applies:
+```python
+gate = sigmoid(self.gate(x))        # [B,L,D] element-wise mask
+retrieved = self.mem_ln(retrieved)   # LayerNorm (centering + scaling)
+out = self.out_proj(gate * retrieved)  # Linear D→D
+return tanh(self.mem_gate_alpha) * out  # ~0.1 scaling
+```
+
+These 4 transforms were never trained by the embedding alignment loss and destroy the alignment.
+
+### The Correct Fix (applied to niah_batch.py)
+
+Use **post-transform `mem_ctx`** at the query position instead of raw `mem_v`:
+
+```python
+# mem_ctx = model.memory_layer(x, mem_k, mem_v, mem_pos, L0)
+# This is the ACTUAL vector added to the residual stream at eval
+target_val = mem_ctx[batch_idx, query_token_idx]    # [B, D] — post-transform
+embed_loss = cosine + CE(target_val @ embed.weight.T, target_token)
+```
+
+**Gradient now flows through**: embed_loss → mem_ctx → memory_layer.forward() → (gate, mem_ln, out_proj, tanh(α), OCR, router) → mem_val_proj. All components learn to preserve alignment. The `tanh(mem_gate_alpha)` will be pushed larger by the gradient, solving the ~10% scaling bottleneck too.
+
+**Requires retraining** — the v4b checkpoint was trained with the old loss and cannot be fixed at eval time.
 
 ---
 
@@ -163,6 +183,13 @@ embed_loss = embed_loss + embed_ce
 - **lm_acc: 0.000 → 0.750**, emb_acc=1.000, r@M=1.000
 - C4 loss: 5.2 → 2.0
 - Best checkpoint at: `/zeng_gk/Amine/Huawei Challenge/RFT/AmineHL/mixed_pilot_v4b_seed42/rft_lm/best_model.pt`
+
+### Run 5: Pilot v4b — RULER S-NIAH EVAL (April 9) — FAILED
+- Sanity check at seq_len=512 with chunk_size=512: 0/10 for both models
+- **Root cause 1**: seq_len=512 = chunk_size means only 1 chunk → memory bank empty → no retrieval possible. Training always uses 2 chunks (context + query).
+- **Root cause 2 (architectural)**: Embedding alignment loss trained raw `mem_v` to align with embeddings, but eval uses `mem_ctx = tanh(α) * out_proj(ln(gate * retrieved))` — transforms destroy alignment.
+- RFT-LM generated digit-like outputs ("38", "33") showing format awareness but wrong values.
+- **Fix applied**: Changed niah_batch.py to train alignment on post-transform `mem_ctx` instead of raw `mem_v`. Requires retraining (v5).
 
 ### Earlier Work: Matched Retrains (April 4)
 - Location: `/data3/adam_transfer/AmineHL/runs_lm/matched_retrains_20260404/`

@@ -2,12 +2,13 @@
 
 ## TL;DR
 
-RFT-LM is a **memory-augmented transformer** with a novel **OCR (Occurrence-Contrastive Resolver)** head for disambiguating retrieved memories. The project has two major validated results:
+RFT-LM is a **memory-augmented transformer** with a novel **OCR (Occurrence-Contrastive Resolver)** head for disambiguating retrieved memories. The project has three major validated results:
 
 1. **Synthetic retrieval**: OCR gives a consistent **+4.6--6.3% val_acc** improvement over base across 513 controlled experiments (master_results.txt).
-2. **Natural-language NIAH training**: The embedding alignment loss **broke through** the memory-to-output bottleneck. NIAH `lm_acc` went from **0.000 to 0.750** over 5960 steps (pilot v4b), with `emb_acc=1.000` and `r@M=1.000` throughout.
+2. **Natural-language NIAH (v4b)**: Embedding alignment loss broke through the memory-to-output bottleneck. lm_acc 0→0.750. But a bug (training on raw mem_v instead of post-transform mem_ctx) limited eval to 42-61%.
+3. **Fixed embedding alignment (v5)**: Corrected loss trains through full memory pipeline. **RULER S-NIAH: 54-61% at depths 0.0-0.5**, up +11-14pp from v4b at 2K. Memory is the sole differentiator (0% without it). OCR remains neutral — needs further investigation.
 
-The key unsolved problem is closing the gap between training-time NIAH accuracy (75%) and RULER S-NIAH evaluation accuracy (0% in prior eval). A formal NIAH eval on the latest checkpoint has not yet been run.
+**Current status**: v5 full eval complete. Next: multi-seed retraining for paper-quality CIs, investigate OCR neutrality, fix depth=1.0.
 
 ---
 
@@ -213,6 +214,55 @@ embed_loss = cosine + CE(target_val @ embed.weight.T, target_token)
 - **Fix applied**: niah_batch.py now uses post-transform `mem_ctx` for embed loss. Requires retraining (v5).
 - **v5 script**: `run_train_v5.sh` — resumes from v3, same hyperparams as v4b, uses fixed loss.
 
+### Run 6: Pilot v5 — Corrected Embedding Alignment (April 9) — VALIDATED
+
+Resumed from v3 checkpoint (NOT v4b, since v4b's gate/ln/proj were shaped by buggy loss). Same hyperparams as v4b but with the fixed `niah_batch.py` that trains embed_loss on post-transform `mem_ctx`.
+
+**Training**: 5960 steps, lm_acc=0.750, emb_acc=1.000 (now measuring POST-transform alignment), emb_loss=2.739.
+
+**Sanity check**: 11/20 (55%) at seq_len=1024, depth=0.5 — vs v4b's ~2/10 (20%).
+
+**Full RULER S-NIAH eval results (100 trials per cell)**:
+
+| Depth | 2048 | 4096 | 8192 |
+|-------|------|------|------|
+| 0.00 | **56%** vs 0% | **61%** vs 0% | **56%** vs 0% |
+| 0.25 | **54%** vs 0% | **60%** vs 0% | **60%** vs 0% |
+| 0.50 | **54%** vs 0% | **61%** vs 0% | **56%** vs 0% |
+| 0.75 | **35%** vs 0% | **44%** vs 0% | **46%** vs 0% |
+| 1.00 | 0% vs 0% | 0% vs 0% | 2% vs 0% |
+
+**v5 vs v4b comparison (key improvements)**:
+
+| Setting | v4b | v5 | Delta |
+|---------|-----|-----|-------|
+| 2K, d=0.0 | 42% | **56%** | **+14pp** |
+| 2K, d=0.5 | 43% | **54%** | **+11pp** |
+| 4K, d=0.5 | 50% | **61%** | **+11pp** |
+| 2K, d=0.75 | 22% | **35%** | **+13pp** |
+| 8K, d=0.75 | 37% | **46%** | **+9pp** |
+
+**Ablation results (v5, 50 trials)**:
+
+| Ablation | 2K d=0.0 | 2K d=0.5 | 4K d=0.0 | 4K d=0.5 |
+|----------|----------|----------|----------|----------|
+| Full v5 | 56% | 54% | 61% | 61% |
+| No OCR | 60% | 60% | 64% | 60% |
+| No Memory | 0% | 0% | 0% | 0% |
+
+**Key findings from v5 eval**:
+1. **Embedding fix validated**: +11-14pp over v4b at 2K, especially at harder depths
+2. **Memory is everything**: 0% without memory across all settings
+3. **OCR is neutral/slightly negative**: No-OCR scores 60-64% vs full v5's 54-61%. OCR may add noise when M=64 already retrieves correctly most of the time. Needs investigation.
+4. **Length generalization**: 4K is the sweet spot (61%), 8K holds up. Model trained at 2K.
+5. **depth=0.75 improved** but still weaker: needle near chunk boundary
+6. **depth=1.0 still 0%**: Architectural limitation (needle in same chunk as probe)
+
+**Result files**:
+- Full: `/zeng_gk/Amine/Huawei Challenge/RFT/AmineHL/mixed_pilot_v5_seed42/niah_v5_full.json`
+- No memory: `.../niah_v5_no_memory.json`
+- No OCR: `.../niah_v5_no_ocr.json`
+
 ### Earlier Work: Matched Retrains (April 4)
 - Location: `/data3/adam_transfer/AmineHL/runs_lm/matched_retrains_20260404/`
 - 3 seeds x 4 variants (baseline, rft_lm, disable_memory, disable_ocr)
@@ -268,37 +318,33 @@ embed_loss = cosine + CE(target_val @ embed.weight.T, target_token)
 1. ~~**Run RULER S-NIAH evaluation on pilot v4b checkpoint**~~ ✅ DONE
    - v4b achieves 42-61% across 2K-8K (vs 0% baseline)
    - Memory is the key differentiator; OCR slightly hurts (buggy training)
-   - depth=1.0 fails (needle in same chunk as probe)
 
-2. **Train pilot v5 with corrected embedding alignment loss** ← IMMEDIATE PRIORITY
-   - `run_train_v5.sh` is ready, resumes from v3 checkpoint
-   - Fix: embed_loss on post-transform `mem_ctx` instead of raw `mem_v`
-   - Expected: 50% → 70-80%+ accuracy; OCR should now help; mem_gate_alpha should grow
-   - Also fixes depth=0.75 weakness if gate/proj learn to amplify signal
+2. ~~**Train pilot v5 with corrected embedding alignment loss**~~ ✅ DONE
+   - v5 achieves 54-61% at depths 0.0-0.5, +11-14pp over v4b at 2K
+   - OCR still neutral (not harmful, but not helping) — unexpected
 
-3. **Fix depth=1.0 failure**
-   - When needle is at depth=1.0, it's in the SAME chunk as the probe
-   - Memory hasn't stored it yet when the query runs (memory only contains previous chunks)
-   - Possible fix: during eval, split last chunk or add the current chunk's states to memory before retrieval
-   - Alternative: accept this as an architectural limitation (sliding window handles in-chunk context)
+3. **Investigate OCR neutrality** ← HIGH PRIORITY
+   - v5 no-OCR (60-64%) slightly outperforms full v5 (54-61%) — within CI but concerning
+   - Hypotheses: (a) M=64 is already selective enough that OCR adds noise; (b) OCR contrastive loss weight too low (0.2); (c) OCR features (recency etc.) not informative for NL NIAH; (d) need more training steps for OCR to converge
+   - Action: try (a) reducing M (e.g. M=128 or 256 to make disambiguation harder), (b) increasing OCR loss weight, (c) analyzing OCR feature importance on NIAH batches
 
-4. **Multi-seed matched retraining** (after v5 is validated)
-   - `run_multi_seed_v4b.sh` is ready (update to use v5 niah_batch.py)
+4. **Multi-seed matched retraining** ← NEXT ACTION
+   - `run_multi_seed_v4b.sh` is ready (uses v5's fixed niah_batch.py)
    - Need 3 seeds x {baseline, rft_lm, rft_lm_disable_ocr, rft_lm_disable_memory}
    - All with the full NIAH+synth+C4 mixed curriculum
    - Produce paper-quality results with confidence intervals
 
-5. **Ablation study** (for the paper)
-   - OCR vs no-OCR — need to re-evaluate after v5 (v4b OCR was broken)
-   - Memory vs no-memory — already validated (42-61% vs ~2%)
-   - Embedding alignment loss vs no alignment — compare v5 vs v4b
-   - depth=1.0 fix: in-chunk retrieval vs memory-only
+5. **Fix depth=1.0 failure**
+   - When needle is at depth=1.0, it's in the SAME chunk as the probe
+   - Memory hasn't stored it yet when the query runs (only contains previous chunks)
+   - Possible fix: during eval, split last chunk or add current chunk to memory before retrieval
+   - Alternative: accept as architectural limitation (sliding window handles in-chunk context)
 
 6. **Perplexity evaluation**
    - Verify RFT-LM doesn't hurt standard LM quality
    - Compare at multiple sequence lengths
 
-6. **Scale experiments**
+7. **Scale experiments**
    - Current: 125M params
    - Target: also test at 350M if compute allows
    - Larger C4 training set
@@ -319,7 +365,8 @@ embed_loss = cosine + CE(target_val @ embed.weight.T, target_token)
 
 | Script | Purpose |
 |--------|---------|
-| `run_eval_v4b.sh` | **Priority 1**: RULER S-NIAH eval on v4b checkpoint. Sanity check → full depth sweep → ablation (disable_memory, disable_ocr). |
+| `run_eval_v4b.sh` | RULER S-NIAH eval on v4b checkpoint. ✅ DONE (42-61%) |
+| `run_eval_v5.sh` | RULER S-NIAH eval on v5 checkpoint. ✅ DONE (54-61%) |
 | `run_eval_multi_seed.sh` | Eval across all multi-seed retrain checkpoints. Produces per-(seed, variant) JSONs. |
 | `aggregate_results.py` | Parses eval JSONs → paper tables (mean±std across seeds), CSV, LaTeX. |
 
@@ -327,6 +374,7 @@ embed_loss = cosine + CE(target_val @ embed.weight.T, target_token)
 
 | Script | Purpose |
 |--------|---------|
+| `run_train_v5.sh` | v5 training with corrected embed loss. ✅ DONE (lm_acc=0.750) |
 | `run_multi_seed_v4b.sh` | 3 seeds × 4 variants, 2-phase training (Phase 1: C4+synth, Phase 2: +NIAH curriculum). |
 
 ### Code Fixes
@@ -362,8 +410,9 @@ embed_loss = cosine + CE(target_val @ embed.weight.T, target_token)
 
 ### On training server
 - Pilot v3 checkpoint: `/zeng_gk/Amine/Huawei Challenge/RFT/AmineHL/mixed_pilot_v3_seed42/rft_lm/best_model.pt`
-- **Pilot v4b checkpoint (LATEST)**: `/zeng_gk/Amine/Huawei Challenge/RFT/AmineHL/mixed_pilot_v4b_seed42/rft_lm/best_model.pt`
-- Pilot v4b step checkpoints: `checkpoint_step{2000,3000,4000,5000}.pt`
+- Pilot v4b checkpoint: `/zeng_gk/Amine/Huawei Challenge/RFT/AmineHL/mixed_pilot_v4b_seed42/rft_lm/best_model.pt`
+- **Pilot v5 checkpoint (LATEST)**: `/zeng_gk/Amine/Huawei Challenge/RFT/AmineHL/mixed_pilot_v5_seed42/rft_lm/best_model.pt`
+- v5 eval results: `/zeng_gk/Amine/Huawei Challenge/RFT/AmineHL/eval_v5_niah/`
 - Tokenizer: `/zeng_gk/Amine/Huawei Challenge/RFT/AmineHL/gpt2_tokenizer`
 - Training data: `/zeng_gk/Amine/Huawei Challenge/RFT/AmineHL/data/c4_train.jsonl`
 - Matched retrains (April 4): `/data3/adam_transfer/AmineHL/runs_lm/matched_retrains_20260404/`

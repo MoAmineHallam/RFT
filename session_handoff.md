@@ -184,12 +184,34 @@ embed_loss = cosine + CE(target_val @ embed.weight.T, target_token)
 - C4 loss: 5.2 → 2.0
 - Best checkpoint at: `/zeng_gk/Amine/Huawei Challenge/RFT/AmineHL/mixed_pilot_v4b_seed42/rft_lm/best_model.pt`
 
-### Run 5: Pilot v4b — RULER S-NIAH EVAL (April 9) — FAILED
-- Sanity check at seq_len=512 with chunk_size=512: 0/10 for both models
-- **Root cause 1**: seq_len=512 = chunk_size means only 1 chunk → memory bank empty → no retrieval possible. Training always uses 2 chunks (context + query).
-- **Root cause 2 (architectural)**: Embedding alignment loss trained raw `mem_v` to align with embeddings, but eval uses `mem_ctx = tanh(α) * out_proj(ln(gate * retrieved))` — transforms destroy alignment.
-- RFT-LM generated digit-like outputs ("38", "33") showing format awareness but wrong values.
-- **Fix applied**: Changed niah_batch.py to train alignment on post-transform `mem_ctx` instead of raw `mem_v`. Requires retraining (v5).
+### Run 5: Pilot v4b — RULER S-NIAH EVAL (April 9) — PARTIAL SUCCESS
+- Sanity check at seq_len=512 (1 chunk): 0/10 — memory empty, no retrieval possible.
+- Sanity check at seq_len=1024 (2 chunks): **2/10** — memory works, model retrieves correctly sometimes.
+- **Full RULER eval results (100 trials per cell)**:
+
+| Depth | 2048 | 4096 | 8192 |
+|-------|------|------|------|
+| 0.00 | **42%** vs 0% | **56%** vs 0% | **55%** vs 0% |
+| 0.25 | **48%** vs 0% | **55%** vs 0% | **59%** vs 0% |
+| 0.50 | **49%** vs 0% | **58%** vs 0% | **61%** vs 0% |
+| 0.75 | **31%** vs 0% | **46%** vs 0% | **49%** vs 0% |
+| 1.00 | 3% vs 0% | 0% vs 0% | 2% vs 0% |
+
+- **Ablation results** (50 trials, 2K/4K):
+  - disable_memory: ~2%/4% — confirms memory is the key differentiator
+  - disable_ocr: 48-64% — OCR actually *hurts* slightly (trained with buggy raw `mem_v` alignment)
+
+- **Key findings**:
+  1. Memory works: 42-61% accuracy vs 0% baseline across all lengths
+  2. Accuracy IMPROVES with longer context (42% at 2K → 61% at 8K) — generalizes beyond training length
+  3. depth=1.0 fails (~0%) — needle in same chunk as probe, not yet in memory when query runs
+  4. depth=0.75 weaker than 0.0-0.5 — needle near chunk boundary
+  5. OCR doesn't help (slightly hurts) — its weights were shaped by buggy embed loss on raw mem_v
+  6. The LM loss path alone (without working embed alignment) got ~50% accuracy
+
+- **Embed alignment bug confirmed**: The loss trained raw `mem_v` alignment, but eval applies gate→LN→proj→tanh(0.1) which destroys it. Despite this, the LM loss (which goes through the full pipeline) provided enough signal for ~50%.
+- **Fix applied**: niah_batch.py now uses post-transform `mem_ctx` for embed loss. Requires retraining (v5).
+- **v5 script**: `run_train_v5.sh` — resumes from v3, same hyperparams as v4b, uses fixed loss.
 
 ### Earlier Work: Matched Retrains (April 4)
 - Location: `/data3/adam_transfer/AmineHL/runs_lm/matched_retrains_20260404/`
@@ -241,32 +263,38 @@ embed_loss = cosine + CE(target_val @ embed.weight.T, target_token)
 
 ## 6) What Has NOT Been Done Yet
 
-### Critical Next Steps (ordered by priority)
+### Critical Next Steps (ordered by priority, updated April 9)
 
-1. **Run RULER S-NIAH evaluation on pilot v4b checkpoint**
-   - This is the most important next step — we need to know if the 75% training lm_acc translates to actual generation accuracy
-   - Use `eval_ruler_niah.py` with depth sweep: depths=[0.0, 0.25, 0.5, 0.75, 1.0]
-   - Test at seq_lens=[2048, 4096, 8192]
-   - Compare RFT-LM vs baseline
+1. ~~**Run RULER S-NIAH evaluation on pilot v4b checkpoint**~~ ✅ DONE
+   - v4b achieves 42-61% across 2K-8K (vs 0% baseline)
+   - Memory is the key differentiator; OCR slightly hurts (buggy training)
+   - depth=1.0 fails (needle in same chunk as probe)
 
-2. **Train longer / with more data**
-   - Current training uses only 5000 docs from C4 (2.4M tokens)
-   - lm_acc was still climbing at end of training (0.500 → 0.750) — more steps will likely help
-   - Consider 50K+ docs, more epochs
+2. **Train pilot v5 with corrected embedding alignment loss** ← IMMEDIATE PRIORITY
+   - `run_train_v5.sh` is ready, resumes from v3 checkpoint
+   - Fix: embed_loss on post-transform `mem_ctx` instead of raw `mem_v`
+   - Expected: 50% → 70-80%+ accuracy; OCR should now help; mem_gate_alpha should grow
+   - Also fixes depth=0.75 weakness if gate/proj learn to amplify signal
 
-3. **Multi-seed matched retraining**
+3. **Fix depth=1.0 failure**
+   - When needle is at depth=1.0, it's in the SAME chunk as the probe
+   - Memory hasn't stored it yet when the query runs (memory only contains previous chunks)
+   - Possible fix: during eval, split last chunk or add the current chunk's states to memory before retrieval
+   - Alternative: accept this as an architectural limitation (sliding window handles in-chunk context)
+
+4. **Multi-seed matched retraining** (after v5 is validated)
+   - `run_multi_seed_v4b.sh` is ready (update to use v5 niah_batch.py)
    - Need 3 seeds x {baseline, rft_lm, rft_lm_disable_ocr, rft_lm_disable_memory}
    - All with the full NIAH+synth+C4 mixed curriculum
    - Produce paper-quality results with confidence intervals
 
-4. **Ablation study** (for the paper)
-   - OCR vs no-OCR (memory without disambiguation)
-   - Memory vs no-memory (baseline transformer)
-   - Embedding alignment loss vs no embedding alignment loss
-   - Different memory layer positions (layer 4, 6, 8)
-   - Different top-M values
+5. **Ablation study** (for the paper)
+   - OCR vs no-OCR — need to re-evaluate after v5 (v4b OCR was broken)
+   - Memory vs no-memory — already validated (42-61% vs ~2%)
+   - Embedding alignment loss vs no alignment — compare v5 vs v4b
+   - depth=1.0 fix: in-chunk retrieval vs memory-only
 
-5. **Perplexity evaluation**
+6. **Perplexity evaluation**
    - Verify RFT-LM doesn't hurt standard LM quality
    - Compare at multiple sequence lengths
 

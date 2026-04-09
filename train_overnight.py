@@ -247,6 +247,17 @@ def train_rft_lm(
         if is_main:
             print(f"[RESUME] Loaded checkpoint from {args.resume_from} (step={resume_step})")
 
+    # Override mem_gate_alpha if requested
+    if args.mem_gate_alpha_init is not None and is_rft_variant:
+        raw_m = model.module if world_size > 1 else model
+        if hasattr(raw_m, "memory_layer") and hasattr(raw_m.memory_layer, "mem_gate_alpha"):
+            old_val = raw_m.memory_layer.mem_gate_alpha.item()
+            with torch.no_grad():
+                raw_m.memory_layer.mem_gate_alpha.fill_(args.mem_gate_alpha_init)
+            if is_main:
+                print(f"[OVERRIDE] mem_gate_alpha: {old_val:.4f} → {args.mem_gate_alpha_init:.4f} "
+                      f"(tanh={torch.tanh(raw_m.memory_layer.mem_gate_alpha).item():.4f})")
+
     # Training
     if is_main:
         print(f"\n[TRAIN] epochs={args.epochs}, steps/epoch={len(dataloader)}, "
@@ -708,6 +719,8 @@ def main():
     # Checkpoint resumption
     ap.add_argument("--resume_from", type=str, default=None,
                     help="Path to checkpoint .pt to resume from (loads model + optimizer).")
+    ap.add_argument("--mem_gate_alpha_init", type=float, default=None,
+                    help="Override mem_gate_alpha after checkpoint load (e.g. 1.0 for tanh(1.0)≈0.76).")
 
     # DDP
     ap.add_argument("--n_gpus", type=int, default=1)

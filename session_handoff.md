@@ -311,51 +311,98 @@ Resumed from v3 checkpoint (NOT v4b, since v4b's gate/ln/proj were shaped by bug
 
 ---
 
-## 6) What Has NOT Been Done Yet
+## 6) Publication Assessment & Roadmap (April 9)
 
-### Critical Next Steps (ordered by priority, updated April 9)
+### Honest Assessment
 
-1. ~~**Run RULER S-NIAH evaluation on pilot v4b checkpoint**~~ ✅ DONE
-   - v4b achieves 42-61% across 2K-8K (vs 0% baseline)
-   - Memory is the key differentiator; OCR slightly hurts (buggy training)
+**Current state**: Solid prototype, not yet publishable at top tier. 56% accuracy is "promising" not "solved." OCR neutrality on NL tasks undermines the main claimed contribution.
 
-2. ~~**Train pilot v5 with corrected embedding alignment loss**~~ ✅ DONE
-   - v5 achieves 54-61% at depths 0.0-0.5, +11-14pp over v4b at 2K
-   - OCR still neutral (not harmful, but not helping) — unexpected
+**What reviewers will reject on**:
+1. **56% accuracy is not compelling enough** — need 80%+ at depths 0.0-0.5
+2. **OCR doesn't help on the target NL task** — only helps on synthetic toy setting
+3. **No comparison with existing methods** (Memorizing Transformers, Infini-attention, Titans)
+4. **Only one benchmark** (NIAH) — need 2-3 tasks minimum
+5. **125M scale only** — need at least one 350M data point
+6. **depth=1.0 = 0%** — complete failure mode needs addressing or careful framing
 
-3. **Investigate OCR neutrality** ← HIGH PRIORITY
-   - v5 no-OCR (60-64%) slightly outperforms full v5 (54-61%) — within CI but concerning
-   - Hypotheses: (a) M=64 is already selective enough that OCR adds noise; (b) OCR contrastive loss weight too low (0.2); (c) OCR features (recency etc.) not informative for NL NIAH; (d) need more training steps for OCR to converge
-   - Action: try (a) reducing M (e.g. M=128 or 256 to make disambiguation harder), (b) increasing OCR loss weight, (c) analyzing OCR feature importance on NIAH batches
+**What's strong**:
+- Memory clearly works (0% → 56% is dramatic)
+- Embedding alignment loss is novel and elegant
+- Length generalization (trained 2K, works at 8K)
+- Good experimental rigor
 
-4. **Multi-seed matched retraining** ← NEXT ACTION
-   - `run_multi_seed_v4b.sh` is ready (uses v5's fixed niah_batch.py)
-   - Need 3 seeds x {baseline, rft_lm, rft_lm_disable_ocr, rft_lm_disable_memory}
-   - All with the full NIAH+synth+C4 mixed curriculum
-   - Produce paper-quality results with confidence intervals
+### Conference Targeting
 
-5. **Fix depth=1.0 failure**
-   - When needle is at depth=1.0, it's in the SAME chunk as the probe
-   - Memory hasn't stored it yet when the query runs (only contains previous chunks)
-   - Possible fix: during eval, split last chunk or add current chunk to memory before retrieval
-   - Alternative: accept as architectural limitation (sliding window handles in-chunk context)
+| Venue | Feasibility | What's Needed |
+|-------|-------------|---------------|
+| **NeurIPS/ICML/ICLR main** | Possible but hard | 80%+ acc, OCR helps, 2+ benchmarks, baseline comparisons |
+| **NeurIPS/ICML workshop** | Very likely | Current results + multi-seed + 1 baseline |
+| **EMNLP/ACL** | Good shot | 80%+ acc, NL retrieval angle, OCR helps |
+| **COLM** | Strong fit | Current trajectory + multi-seed + 1 comparison |
 
-6. **Perplexity evaluation**
-   - Verify RFT-LM doesn't hurt standard LM quality
-   - Compare at multiple sequence lengths
+### Phase 1: Get Accuracy to 80%+ (IMMEDIATE — highest impact)
 
-7. **Scale experiments**
-   - Current: 125M params
-   - Target: also test at 350M if compute allows
-   - Larger C4 training set
+The single most impactful improvement. The embedding fix took 42% → 56%, more headroom exists:
 
-### Paper-Level TODOs
+**a) Increase `mem_gate_alpha` init** — currently `tanh(0.1) ≈ 0.1`, memory is only 10% of residual. Init at 1.0 or 2.0 (`tanh(2.0) ≈ 0.96`). Gradient can now train this since v5 flows through it.
 
-- Literature comparison with Titans MAC, Mamba, Infini-attention, Memorizing Transformers
-- Standard benchmarks beyond NIAH (if applicable at 125M scale)
-- Clear framing of what's novel: OCR disambiguation is the key contribution
-- Efficiency analysis: memory overhead, inference latency vs context length
-- Analysis of what OCR actually learns (feature importance, attention patterns)
+**b) Train longer** — v5 ran 5960 steps (20 epochs, 5K docs). lm_acc still climbing. Try 40-60 epochs or 15K+ docs.
+
+**c) Increase NIAH ratio** — currently 30%, try 50%. C4 loss already converged (2.0).
+
+**d) Increase `niah_decode_w`** — currently 5.0, embed_loss now meaningful. Try 10.0 or 15.0.
+
+**v6 training script**: `run_train_v6.sh` — combines (a)-(d). Resume from v3, longer training.
+
+### Phase 2: Make OCR Help (after Phase 1)
+
+Without this, OCR cannot be a main contribution:
+
+**a) Increase M** — from 64 to 256/512. When M=64, correct answer is almost always there and disambiguation is trivial. M=256 adds noise OCR must filter.
+
+**b) Multi-needle queries** — query 2-3 needles simultaneously. OCR positional features become critical.
+
+**c) Increase OCR loss weight** — 0.2 is tiny vs lm_ce (3.0) and embed (5.0). Try 1.0-2.0.
+
+**d) Fallback**: If OCR still doesn't help, pivot paper framing to "embedding alignment + memory routing" with OCR as secondary synthetic-only contribution.
+
+### Phase 3: Baselines & Benchmarks (after Phase 1-2)
+
+**a) Full-attention baseline** — `BaselineTransformerLM` with context=2048/4096/8192 (no chunking). Shows what chunked+memory gains vs. loses.
+
+**b) Memorizing Transformers comparison** — simple kNN retrieval baseline (store hidden states, retrieve top-k by dot product).
+
+**c) Additional benchmarks** (pick 1-2):
+- Multi-needle NIAH (already in RULER)
+- Passkey retrieval
+- QA/summarization from LongBench or SCROLLS
+
+### Phase 4: Paper-Quality Results (after Phase 1-3)
+
+**a) Multi-seed retraining** — 3 seeds × {full, -OCR, -memory, -embed_align} (`run_multi_seed_v4b.sh` ready)
+
+**b) Clean ablation table** — after fixing OCR: {full, -OCR, -memory, -embed_align} × {2K, 4K, 8K}
+
+**c) Analysis figures** — attention heatmaps, OCR feature importance, mem_gate_alpha trajectory
+
+---
+
+## 7) What Has Been Done
+
+1. ~~Run RULER S-NIAH evaluation on v4b~~ ✅ (42-61%)
+2. ~~Train v5 with corrected embedding alignment~~ ✅ (54-61%, +11-14pp)
+3. ~~Full v5 eval with ablations~~ ✅ (memory=key, OCR=neutral)
+
+### Still TODO (ordered)
+
+1. **Train v6 with higher mem_gate_alpha + longer training** ← IMMEDIATE
+2. **Investigate OCR neutrality** (increase M, OCR loss weight)
+3. **Multi-seed retraining** (after v6 validated)
+4. **Baseline comparisons** (full-attention, Memorizing Transformers)
+5. **Additional benchmarks** (multi-needle NIAH, passkey, LongBench)
+6. **Fix depth=1.0** (split last chunk or accept as limitation)
+7. **Perplexity evaluation**
+8. **Scale to 350M** (if compute allows)
 
 ---
 
@@ -423,20 +470,33 @@ Resumed from v3 checkpoint (NOT v4b, since v4b's gate/ln/proj were shaped by bug
 
 ---
 
-## 9) Strategic Notes
+## 10) Strategic Notes
+
+### Paper Framing Options
+
+**Option A (if OCR starts helping after Phase 2)**:
+"OCR Disambiguation + Embedding Alignment for Memory-Augmented Transformers"
+- Two clean contributions: OCR head + alignment loss
+- Strongest narrative, both components earn their place
+
+**Option B (if OCR remains neutral on NL)**:
+"Embedding Alignment Loss for Trainable Long-Context Memory in Transformers"
+- Main contribution: the alignment training technique
+- OCR is secondary (helps on synthetic, neutral on NL — honest framing)
+- Still publishable — the alignment loss is genuinely novel and generalizable
 
 ### What Makes This Paper-Worthy
 
-1. **OCR is a clean, validated contribution**: +5% improvement across 513 experiments with controlled ablation. No prior work uses occurrence-contrastive disambiguation for memory retrieval in transformers.
+1. **Embedding alignment loss** is the strongest contribution: Novel technique solving the well-known problem of routing memory through intermediate transformer layers. The insight that tied embeddings create a shortcut (mem_val aligned to embed space → boosts correct logit) is elegant and generalizable to other memory-augmented architectures.
 
-2. **The embedding alignment loss is a novel training technique**: Solves the well-known problem of routing memory information through intermediate transformer layers to the output. The insight that tied embeddings create a shortcut (mem_val aligned to embed space → naturally boosts correct logit) is elegant and generalizable.
+2. **OCR** (if it helps): No prior work uses occurrence-contrastive disambiguation for memory retrieval. Clean ablation across 513 experiments.
 
-3. **Mixed-objective curriculum**: Three-way training (C4 + synthetic retrieval + natural-language NIAH) that progressively bridges abstract retrieval to natural language — each objective addresses a different aspect of the memory system.
+3. **Mixed-objective curriculum**: Three-way training (C4 + synthetic + NL NIAH) bridging abstract retrieval to natural language.
 
-### Risks / Open Questions
+### Key Risks
 
-- **NIAH eval gap**: Training lm_acc=0.750 doesn't guarantee RULER eval accuracy (generation is harder than single-step prediction)
-- **Scale**: All results at 125M params — reviewers may ask about scaling
-- **Complexity**: 8+ interacting components, 10+ loss weights — hard to ablate cleanly; need to show each piece is necessary
-- **The `tanh(mem_gate_alpha=0.1)` bottleneck**: Still limits memory signal to ~10% of residual stream. May need to increase or make adaptive.
-- **Competing with Titans/Mamba**: These are from Google/CMU with massive compute. Our advantage must be novelty (OCR) not scale.
+- **OCR neutrality on NL tasks**: Biggest risk to the paper narrative. Must be resolved (Phase 2) or honestly framed.
+- **Scale**: 125M only. Mitigate by framing as "efficient long-context" and adding one 350M data point.
+- **Complexity**: 8+ components, 10+ loss weights. Clean ablation table essential.
+- **Competing methods**: Titans/Mamba from Google/CMU with massive compute. Our advantage is novelty not scale.
+- **56% accuracy ceiling**: Must push to 80%+ via mem_gate_alpha / longer training (Phase 1).

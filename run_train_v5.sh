@@ -57,6 +57,9 @@ echo "================================================================"
 echo ""
 
 # ── Training ──────────────────────────────────────────────────────────
+# Pre-create output dir so tee doesn't fail
+mkdir -p "$OUTDIR/rft_lm"
+
 # Match v4b hyperparams exactly, except using the fixed niah_batch.py
 python "$SCRIPT_DIR/train_overnight.py" \
     --data_path "$DATA" \

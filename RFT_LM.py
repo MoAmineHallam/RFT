@@ -133,7 +133,8 @@ class RFTMemoryLayer(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
 
-        # Router projection (query-side; memory keys are projected at write time)
+        # Router projection (query-side; memory keys are projected at write time).
+        # Keep attribute name `router_q` for checkpoint compatibility.
         self.router_q = nn.Linear(d_model, d_model, bias=False)
 
         # Value projection for retrieved context

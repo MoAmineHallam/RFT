@@ -399,14 +399,14 @@ with open(out_json, "w", encoding="utf-8") as f:
     json.dump(summary, f, indent=2)
 
 with open(out_md, "w", encoding="utf-8") as f:
-    f.write("# Go/No-Go Decision\\n\\n")
-    f.write(f"**Decision:** {decision}\\n\\n")
-    f.write("## Criterion\\n")
-    f.write("- RFT vs baseline NIAH delta-accuracy CI95 lower bound must be > 0 at each length (2048/4096/8192).\\n\\n")
-    f.write("## Per-length delta (RFT - baseline)\\n")
+    f.write("# Go/No-Go Decision\n\n")
+    f.write(f"**Decision:** {decision}\n\n")
+    f.write("## Criterion\n")
+    f.write("- RFT vs baseline NIAH delta-accuracy CI95 lower bound must be > 0 at each length (2048/4096/8192).\n\n")
+    f.write("## Per-length delta (RFT - baseline)\n")
     for s in seq_lens:
         rec = per_len[s]
-        f.write(f"- seq_len={s}: mean={rec['delta_acc_mean']}, ci95={rec['delta_acc_ci95']}\\n")
+        f.write(f"- seq_len={s}: mean={rec['delta_acc_mean']}, ci95={rec['delta_acc_ci95']}\n")
 
 print(out_json)
 print(out_md)
@@ -414,4 +414,3 @@ PY
 
 if [ ! -s "$ERRORS" ]; then echo "none" > "$ERRORS"; fi
 echo "[DONE] $(date -Is)" | tee -a "$RUNBOOK"
-

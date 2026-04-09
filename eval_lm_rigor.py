@@ -63,6 +63,8 @@ def load_val_tokens(path: str, tokenizer_path: str, max_docs: int) -> Tuple[torc
 def load_rft(path: str, device: torch.device):
     ck = torch.load(path, map_location="cpu", weights_only=False)
     a = ck["args"]
+    model_variant = a.get("model", "rft_lm")
+    use_memory = model_variant != "rft_lm_disable_memory"
     model = RFTLM(
         vocab_size=a["vocab_size"],
         d_model=a["d_model"],
@@ -72,7 +74,7 @@ def load_rft(path: str, device: torch.device):
         ff_mult=a["ff_mult"],
         dropout=0.0,
         memory_layer_idx=a["memory_layer_idx"],
-        use_memory=True,
+        use_memory=use_memory,
         mem_top_m=a["mem_top_m"],
         ocr_dim=a["ocr_dim"],
     ).to(device)

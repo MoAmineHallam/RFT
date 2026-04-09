@@ -3,7 +3,7 @@ synth_batch.py — Synthetic KV-retrieval batches for mixed-objective RFT-LM tra
 
 Purpose
 -------
-The LM training on C4 provides no signal to router_q/router_k about which
+The LM training on C4 provides no signal to query routing about which
 past memory slot is correct. This module restores the supervised retrieval
 objective from RFT_ocr.py (which achieved recall@M ~1.00) and applies it
 directly to the RFT-LM memory layer.

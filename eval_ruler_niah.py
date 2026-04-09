@@ -321,6 +321,8 @@ def eval_at_depth(
 def load_rft_model(path: str, device: torch.device) -> RFTLM:
     ck = torch.load(path, map_location="cpu", weights_only=False)
     a = ck["args"]
+    model_variant = a.get("model", "rft_lm")
+    use_memory = model_variant != "rft_lm_disable_memory"
     model = RFTLM(
         vocab_size=a["vocab_size"],
         d_model=a["d_model"],
@@ -330,7 +332,7 @@ def load_rft_model(path: str, device: torch.device) -> RFTLM:
         ff_mult=a["ff_mult"],
         dropout=0.0,
         memory_layer_idx=a["memory_layer_idx"],
-        use_memory=True,
+        use_memory=use_memory,
         mem_top_m=a["mem_top_m"],
         ocr_dim=a["ocr_dim"],
     ).to(device)
@@ -529,4 +531,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

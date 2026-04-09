@@ -133,9 +133,8 @@ class RFTMemoryLayer(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
 
-        # Router projections
+        # Router projection (query-side; memory keys are projected at write time)
         self.router_q = nn.Linear(d_model, d_model, bias=False)
-        self.router_k = nn.Linear(d_model, d_model, bias=False)
 
         # Value projection for retrieved context
         self.mem_v = nn.Linear(d_model, d_model, bias=False)
@@ -342,7 +341,7 @@ class RFTMemoryLayer(nn.Module):
         Supervised retrieval loss for synthetic KV-retrieval batches.
 
         Given that we know the correct memory slot per example, this trains
-        router_q/router_k (router_ce + top-M hinge) and the OCR head
+        the query router (router_ce + top-M hinge) and the OCR head
         (pointer_ce + OCR hinge vs hardest negative). This mirrors the
         multi-term loss from RFT_ocr.py that produced recall ~1.00.
         """

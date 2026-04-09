@@ -185,7 +185,7 @@ def niah_retrieval_step(
     One NIAH-format training step through the RFT-LM.
 
     Combines:
-      (a) supervised_retrieval_loss — trains router_q/router_k + OCR to
+      (a) supervised_retrieval_loss — trains query routing + OCR to
           retrieve the correct memory slot (same losses as synth_batch.py).
       (b) LM cross-entropy at the probe position — trains the output head
           (and all downstream layers) to actually *emit* the value token,

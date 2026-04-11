@@ -600,6 +600,212 @@ class RFTLM(nn.Module):
 
 
 # ─────────────────────────────────────────────
+# Memorizing Transformers kNN Memory Layer (Wu et al. 2022)
+# ─────────────────────────────────────────────
+#
+# Plain top-K dot-product retrieval over a memory of past (k, v) pairs,
+# followed by softmax attention and a gated residual add. NO recency
+# bias, NO OCR, NO supervised routing. Intentionally minimal so we can
+# test whether embedding alignment loss is the unlock, not the router.
+class MTMemoryLayer(nn.Module):
+    """
+    Memorizing-Transformers-style kNN memory (Wu et al., 2022).
+
+    For each query position, retrieves the top-K nearest past hidden
+    states by dot-product similarity, attends over their values, and
+    merges the result into the residual stream through a learned gate.
+    """
+
+    def __init__(self, d_model: int, top_k: int = 32, gate_alpha_init: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.top_k = top_k
+
+        # Separate Q/K/V projections for the kNN pathway
+        self.mem_q = nn.Linear(d_model, d_model, bias=False)
+        self.mem_ln = nn.LayerNorm(d_model)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+
+        # Gated residual scalar (same parameterization as RFTMemoryLayer)
+        self.mem_gate_alpha = nn.Parameter(torch.tensor(float(gate_alpha_init)))
+
+    def forward(self, x: torch.Tensor, memory_keys: torch.Tensor,
+                memory_vals: torch.Tensor, memory_positions: torch.Tensor,
+                current_pos_start: int) -> torch.Tensor:
+        """
+        x: [B, L, D] current chunk hidden states
+        memory_keys: [B, N_mem, D]
+        memory_vals: [B, N_mem, D]
+        memory_positions: [B, N_mem]  (unused — MT has no recency bias)
+        current_pos_start: int
+        Returns: [B, L, D] memory context to be added residually.
+        """
+        B, L, D = x.shape
+        N_mem = memory_keys.shape[1]
+        if N_mem == 0:
+            return torch.zeros_like(x)
+
+        K = min(self.top_k, N_mem)
+
+        q = self.mem_q(x)  # [B, L, D]
+        scores = torch.einsum("bld,bnd->bln", q, memory_keys) / math.sqrt(D)  # [B, L, N_mem]
+
+        top_scores, top_idx = torch.topk(scores, k=K, dim=-1)  # [B, L, K]
+
+        # Gather candidate values per batch
+        cand_vals = torch.zeros(B, L, K, D, device=x.device, dtype=memory_vals.dtype)
+        for b in range(B):
+            cand_vals[b] = memory_vals[b][top_idx[b]]
+
+        attn_weights = F.softmax(top_scores, dim=-1).unsqueeze(-1)  # [B, L, K, 1]
+        retrieved = (attn_weights * cand_vals).sum(dim=2)  # [B, L, D]
+
+        retrieved = self.mem_ln(retrieved)
+        out = self.out_proj(retrieved)
+        return torch.tanh(self.mem_gate_alpha) * out
+
+
+# ─────────────────────────────────────────────
+# MTLM: Memorizing-Transformers-style baseline (for Gate 1A head-to-head)
+# ─────────────────────────────────────────────
+class MTLM(nn.Module):
+    """
+    Sliding-window transformer LM with a Memorizing-Transformers-style
+    kNN memory layer inserted at `memory_layer_idx`.
+
+    Interface-compatible with RFTLM:
+      - forward(...) returns a dict with 'logits' and (optionally)
+        'new_mem_keys', 'new_mem_vals'
+      - supports MemoryBank + train_step_chunked
+
+    Intentionally does NOT include:
+      - OCR head / supervised retrieval loss
+      - Recency bias
+      - Synthetic KV objectives
+
+    The `niah_decode_w` alignment loss (applied externally) is the only
+    training-time difference between the "with alignment" and "without
+    alignment" variants used for Gate 1A.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 768,
+        n_layers: int = 12,
+        n_heads: int = 12,
+        window_size: int = 512,
+        ff_mult: int = 4,
+        dropout: float = 0.0,
+        max_len: int = 65536,
+        memory_layer_idx: int = 6,
+        use_memory: bool = True,
+        mem_top_k: int = 32,
+        mem_gate_alpha_init: float = 1.0,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.n_layers = n_layers
+        self.window_size = window_size
+        self.memory_layer_idx = memory_layer_idx
+        self.use_memory = use_memory
+        self.vocab_size = vocab_size
+
+        self.embed = nn.Embedding(vocab_size, d_model)
+        self.embed_scale = math.sqrt(d_model)
+        self.rope = RotaryEmbedding(d_model // n_heads, max_len)
+        self.drop = nn.Dropout(dropout)
+
+        self.layers = nn.ModuleList([
+            TransformerBlock(d_model, n_heads, window_size, ff_mult, dropout)
+            for _ in range(n_layers)
+        ])
+
+        if use_memory:
+            self.memory_layer = MTMemoryLayer(
+                d_model=d_model,
+                top_k=mem_top_k,
+                gate_alpha_init=mem_gate_alpha_init,
+            )
+            # Memory entry projections — matches RFTLM naming so MemoryBank
+            # and train_step_chunked work unchanged.
+            self.mem_key_proj = nn.Linear(d_model, d_model, bias=False)
+            self.mem_val_proj = nn.Linear(d_model, d_model, bias=False)
+
+        self.ln_f = nn.LayerNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head.weight = self.embed.weight  # tied
+
+        self._init_weights()
+
+        # Expose mem_gate_alpha at top level so --mem_gate_alpha_init CLI
+        # override can find it without special-casing.
+        if use_memory:
+            # (already on self.memory_layer)
+            pass
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, std=0.02)
+
+    def count_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        memory_keys: Optional[torch.Tensor] = None,
+        memory_vals: Optional[torch.Tensor] = None,
+        memory_positions: Optional[torch.Tensor] = None,
+        pos_offset: int = 0,
+        return_memory_state: bool = False,
+        compute_ocr_loss: bool = False,  # accepted for API compat, ignored
+        ocr_margin: float = 0.10,
+        detach_memory: bool = True,
+    ) -> dict:
+        B, L = input_ids.shape
+        D = self.d_model
+
+        x = self.embed(input_ids) * self.embed_scale
+        x = self.drop(x)
+
+        rope_cos, rope_sin = self.rope(L, offset=pos_offset)
+
+        new_mem_keys = None
+        new_mem_vals = None
+
+        for i, layer in enumerate(self.layers):
+            x = layer(x, rope_cos, rope_sin, pos_offset)
+
+            if (i == self.memory_layer_idx) and self.use_memory:
+                if return_memory_state:
+                    x_mem = x.detach() if detach_memory else x
+                    new_mem_keys = self.mem_key_proj(x_mem)
+                    new_mem_vals = self.mem_val_proj(x_mem)
+
+                if memory_keys is not None and memory_keys.shape[1] > 0:
+                    mem_ctx = self.memory_layer(
+                        x, memory_keys, memory_vals,
+                        memory_positions, pos_offset,
+                    )
+                    x = x + mem_ctx
+
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+
+        out = {"logits": logits}
+        if return_memory_state and new_mem_keys is not None:
+            out["new_mem_keys"] = new_mem_keys
+            out["new_mem_vals"] = new_mem_vals
+        return out
+
+
+# ─────────────────────────────────────────────
 # Baseline: Standard Transformer LM (no memory)
 # ─────────────────────────────────────────────
 class BaselineTransformerLM(nn.Module):

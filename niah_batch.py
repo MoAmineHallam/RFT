@@ -322,3 +322,109 @@ def niah_retrieval_step(
         "niah_fused_acc": float(ret["fused_acc"].item()),
     }
     return float(total.item()), metrics
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Memorizing-Transformers NIAH step (Gate 1A head-to-head)
+# ─────────────────────────────────────────────────────────────────────
+def mt_niah_retrieval_step(
+    raw_model,
+    batch,
+    loss_weights: dict,
+    do_backward: bool = True,
+) -> Tuple[float, dict]:
+    """
+    NIAH training step for MTLM (Memorizing-Transformers baseline).
+
+    Differences vs. niah_retrieval_step (RFT):
+      - No OCR / router / pointer / topm loss (MT has no supervised router)
+      - Only LM loss at the probe + optional embedding alignment loss on
+        the post-retrieval memory context at the query position.
+
+    The single knob that toggles Gate 1A's two variants is
+    loss_weights['decode']:
+        decode > 0  → "MT + alignment loss"
+        decode = 0  → "MT (vanilla Memorizing Transformers baseline)"
+    """
+    ctx_chunk, qry_chunk, target_mem_idx, query_token_idx, target_token_ids = batch
+    B, L0 = ctx_chunk.shape
+    _, L1 = qry_chunk.shape
+
+    memory_bank = MemoryBank(max_entries=L0)
+
+    # Chunk 0: populate memory WITH gradients
+    out0 = raw_model(
+        ctx_chunk,
+        memory_keys=None,
+        memory_vals=None,
+        memory_positions=None,
+        pos_offset=0,
+        return_memory_state=True,
+        detach_memory=False,
+    )
+    memory_bank.add(out0["new_mem_keys"], out0["new_mem_vals"], 0, L0)
+    mem_k, mem_v, mem_pos = memory_bank.get_state()
+
+    # Chunk 1: manual forward, capturing mem_ctx at the memory layer
+    model = raw_model
+    x = model.embed(qry_chunk) * model.embed_scale
+    x = model.drop(x)
+    rope_cos, rope_sin = model.rope(L1, offset=L0)
+
+    mem_ctx = None
+    for i, layer in enumerate(model.layers):
+        x = layer(x, rope_cos, rope_sin, L0)
+        if i == model.memory_layer_idx:
+            if model.use_memory and mem_k is not None and mem_k.shape[1] > 0:
+                mem_ctx = model.memory_layer(x, mem_k, mem_v, mem_pos, L0)
+                x = x + mem_ctx
+
+    x = model.ln_f(x)
+    logits = model.lm_head(x)  # [B, L1, vocab]
+
+    # LM loss at query position
+    batch_idx = torch.arange(B, device=logits.device)
+    query_logits = logits[batch_idx, query_token_idx]
+    lm_loss = F.cross_entropy(query_logits, target_token_ids)
+
+    with torch.no_grad():
+        lm_pred = query_logits.argmax(dim=-1)
+        lm_acc = (lm_pred == target_token_ids).float().mean()
+
+    # Embedding alignment loss (the Gate 1A knob)
+    embed_loss = torch.tensor(0.0, device=logits.device)
+    embed_acc = torch.tensor(0.0, device=logits.device)
+    decode_w = loss_weights.get("decode", 0.0)
+    if mem_ctx is not None and decode_w > 0:
+        target_val = mem_ctx[batch_idx, query_token_idx]     # [B, D]
+        target_embed = model.embed.weight[target_token_ids]  # [B, D]
+
+        cos_sim = F.cosine_similarity(target_val, target_embed, dim=-1)
+        embed_loss = (1.0 - cos_sim).mean()
+
+        val_logits = torch.matmul(target_val, model.embed.weight.T)
+        embed_ce = F.cross_entropy(val_logits, target_token_ids)
+        embed_loss = embed_loss + embed_ce
+
+        with torch.no_grad():
+            embed_pred = val_logits.argmax(dim=-1)
+            embed_acc = (embed_pred == target_token_ids).float().mean()
+
+    total = loss_weights.get("lm_ce", 1.0) * lm_loss + decode_w * embed_loss
+
+    if do_backward:
+        total.backward()
+
+    metrics = {
+        "niah_loss": float(total.item()),
+        "niah_lm_ce": float(lm_loss.item()),
+        "niah_lm_acc": float(lm_acc.item()),
+        "niah_embed_loss": float(embed_loss.item()),
+        "niah_embed_acc": float(embed_acc.item()),
+        "niah_router_ce": 0.0,
+        "niah_topm_hinge": 0.0,
+        "niah_recall_at_m": 0.0,
+        "niah_pointer_acc": 0.0,
+        "niah_fused_acc": 0.0,
+    }
+    return float(total.item()), metrics

@@ -34,9 +34,19 @@ We own: **"training-time fix that works across memory-augmented architectures at
 - RFT-LM architecture: 125M GPT-2 + sliding window + FIFO memory bank + top-M router + `mem_gate_alpha` gate
 - **Embedding alignment loss** (post-transform `mem_ctx` → tied embedding)
 - v6 recipe: gate_alpha=1.0, 40 epochs, decode_w=10.0
-- v6 RULER S-NIAH: **96-97% at 2K d=0.0-0.5, 90-95% at 8K, base 0%**
+- v6 RULER S-NIAH headline (post tail-fix): **full grid 89-98% mean ~91%, base flat 0%**
 - v6 ablations: no-memory = 0%, memory is sole differentiator
-- Tail-chunk eval fix for d=1.0 (shipped, not yet run)
+- **Gate 1B ✅ PASSED** — tail-chunk eval fix (K=8, inference-time only, no retrain).
+  Full RULER S-NIAH grid after fix (baseline flat 0% everywhere):
+
+  | L | d=0.00 | d=0.25 | d=0.50 | d=0.75 | d=1.00 | mean |
+  |---|---|---|---|---|---|---|
+  | 2048 | 97 | 96 | 97 | 75 | 98 | 92.6 |
+  | 4096 | 92 | 94 | 96 | 73 | 98 | 90.6 |
+  | 8192 | 92 | 92 | 94 | 74 | 95 | 89.4 |
+
+  d=1.0 went from 0 → 95-98%. Only remaining soft cell: d=0.75 at ~73-75%
+  (real model weakness, not a bug). Accept for first submission.
 - `--mem_gate_alpha_init` CLI override
 - Paper framing locked as Option B (training technique, not architecture)
 
@@ -69,7 +79,7 @@ We own: **"training-time fix that works across memory-augmented architectures at
 | Gate | Experiment | Where | Cost | Pass criterion | On failure |
 |---|---|---|---|---|---|
 | **1A** | **Memorizing Transformers kNN baseline @ 125M, with and without alignment loss** | V100 | ~2-3 days | alignment loss lifts kNN by ≥20pp at d=0.0-0.5 | Contribution is not plug-in → reframe as architecture-specific |
-| **1B** | Tail-chunk eval fix on v6 (already implemented) | V100 | ~2 hours | d=1.0 → ≥50% with K-sweep | Accept d=1.0 as limitation |
+| **1B** ✅ | Tail-chunk eval fix on v6 — **DONE, K=8, d=1.0 → 95-98%, mean ~91% across full grid** | V100 | ~2 hours | d=1.0 → ≥50% with K-sweep | — |
 | **1C** | Multi-seed v6 @ 125M (3 seeds × 2 variants: full, −embed_align) | V100 | ~3 GPU-days parallel | σ < 5pp across seeds | Harden recipe |
 | **1D** | Passkey + multi-needle RULER eval of v6 (no retrain) | V100 | ~6 hrs | ≥80% on new prompts | Retrain with mixed prompts |
 | **1E** | (optional) Neurocache-style compressed kNN baseline | V100 | ~3 days | alignment loss also helps it | Drop, single-baseline plug-in claim |

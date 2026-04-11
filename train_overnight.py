@@ -41,11 +41,13 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 # Import from our architecture file
 from RFT_LM import (
-    RFTLM, BaselineTransformerLM, MemoryBank,
+    RFTLM, MTLM, BaselineTransformerLM, MemoryBank,
     train_step_chunked,
 )
 from synth_batch import SynthBatchConfig, SyntheticKVBatchGen, synthetic_retrieval_step
-from niah_batch import NIAHBatchConfig, NIAHBatchGen, niah_retrieval_step
+from niah_batch import (
+    NIAHBatchConfig, NIAHBatchGen, niah_retrieval_step, mt_niah_retrieval_step,
+)
 
 
 # ─────────────────────────────────────────────
@@ -169,7 +171,9 @@ def train_rft_lm(
 
     # Build model
     is_rft_variant = args.model in {"rft_lm", "rft_lm_disable_memory", "rft_lm_disable_ocr"}
-    use_memory = args.model != "rft_lm_disable_memory"
+    is_mt_variant = args.model in {"mt_lm", "mt_lm_disable_memory"}
+    has_memory_layer = is_rft_variant or is_mt_variant
+    use_memory = args.model not in {"rft_lm_disable_memory", "mt_lm_disable_memory"}
     if is_rft_variant:
         model = RFTLM(
             vocab_size=args.vocab_size,
@@ -188,6 +192,20 @@ def train_rft_lm(
             with torch.no_grad():
                 model.memory_layer.ocr_alpha.fill_(0.0)
             model.memory_layer.ocr_alpha.requires_grad_(False)
+    elif is_mt_variant:
+        model = MTLM(
+            vocab_size=args.vocab_size,
+            d_model=args.d_model,
+            n_layers=args.n_layers,
+            n_heads=args.n_heads,
+            window_size=args.window_size,
+            ff_mult=args.ff_mult,
+            dropout=args.dropout,
+            memory_layer_idx=args.memory_layer_idx,
+            use_memory=use_memory,
+            mem_top_k=args.mem_top_m,  # reuse flag
+            mem_gate_alpha_init=(args.mem_gate_alpha_init if args.mem_gate_alpha_init is not None else 1.0),
+        ).to(device)
     else:
         model = BaselineTransformerLM(
             vocab_size=args.vocab_size,
@@ -207,6 +225,10 @@ def train_rft_lm(
         if is_rft_variant:
             print(f"[MODEL] memory_layer_idx={args.memory_layer_idx}, "
                   f"mem_top_m={args.mem_top_m}, ocr_dim={args.ocr_dim}")
+            print(f"[MODEL] use_memory={use_memory}")
+        elif is_mt_variant:
+            print(f"[MODEL] memory_layer_idx={args.memory_layer_idx}, "
+                  f"mem_top_k={args.mem_top_m} (kNN, no OCR, no recency)")
             print(f"[MODEL] use_memory={use_memory}")
 
     # DDP wrap
@@ -247,8 +269,8 @@ def train_rft_lm(
         if is_main:
             print(f"[RESUME] Loaded checkpoint from {args.resume_from} (step={resume_step})")
 
-    # Override mem_gate_alpha if requested
-    if args.mem_gate_alpha_init is not None and is_rft_variant:
+    # Override mem_gate_alpha if requested (works for RFT + MT variants)
+    if args.mem_gate_alpha_init is not None and has_memory_layer:
         raw_m = model.module if world_size > 1 else model
         if hasattr(raw_m, "memory_layer") and hasattr(raw_m.memory_layer, "mem_gate_alpha"):
             old_val = raw_m.memory_layer.mem_gate_alpha.item()
@@ -266,7 +288,7 @@ def train_rft_lm(
               f"seq_len={args.total_seq_len}, chunk_size={args.chunk_size}")
         print(f"[TRAIN] lr={args.lr}, warmup={warmup_steps}\n")
 
-    memory_bank = MemoryBank(max_entries=args.total_seq_len) if is_rft_variant else None
+    memory_bank = MemoryBank(max_entries=args.total_seq_len) if has_memory_layer else None
 
     # Synthetic retrieval batch generator (only for rft_lm with memory enabled)
     use_synth = is_rft_variant and use_memory and args.model == "rft_lm" and args.synth_ratio > 0
@@ -298,7 +320,12 @@ def train_rft_lm(
                   f"ptr={args.synth_pointer_w} ocr={args.synth_ocr_w} scale={args.synth_loss_scale}")
 
     # NIAH natural-language retrieval batch generator
-    use_niah = is_rft_variant and use_memory and args.model == "rft_lm" and args.niah_ratio > 0
+    # Enabled for RFT-LM (full pipeline) and MTLM (lm + optional embed align).
+    use_niah = (
+        use_memory
+        and args.niah_ratio > 0
+        and (args.model == "rft_lm" or args.model == "mt_lm")
+    )
     niah_gen = None
     niah_loss_weights = {
         "lm_ce": args.niah_lm_w,
@@ -398,9 +425,14 @@ def train_rft_lm(
             if do_niah_step:
                 niah_batch = next(niah_gen)
                 scaled_nw = {k: v * args.niah_loss_scale for k, v in niah_loss_weights.items()}
-                _, niah_metrics = niah_retrieval_step(
-                    raw_model, niah_batch, scaled_nw, do_backward=True,
-                )
+                if args.model == "mt_lm":
+                    _, niah_metrics = mt_niah_retrieval_step(
+                        raw_model, niah_batch, scaled_nw, do_backward=True,
+                    )
+                else:
+                    _, niah_metrics = niah_retrieval_step(
+                        raw_model, niah_batch, scaled_nw, do_backward=True,
+                    )
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
                 scheduler.step()
@@ -473,8 +505,8 @@ def train_rft_lm(
                         f.write(json.dumps(record) + "\n")
                 continue
 
-            if is_rft_variant:
-                # Chunked training with memory
+            if has_memory_layer:
+                # Chunked training with memory (RFT or MT)
                 memory_bank.reset()
                 effective_ocr_loss_weight = args.ocr_loss_weight if args.model == "rft_lm" else 0.0
                 loss, metrics = train_step_chunked(
@@ -640,7 +672,8 @@ def main():
 
     # Model selection
     ap.add_argument("--model", type=str, default="rft_lm",
-                    choices=["rft_lm", "rft_lm_disable_memory", "rft_lm_disable_ocr", "baseline"])
+                    choices=["rft_lm", "rft_lm_disable_memory", "rft_lm_disable_ocr",
+                             "mt_lm", "mt_lm_disable_memory", "baseline"])
 
     # Model architecture
     ap.add_argument("--vocab_size", type=int, default=50257,

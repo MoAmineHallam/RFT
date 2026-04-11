@@ -40,7 +40,7 @@ from eval_ruler_niah import (
 def run_sanity(model, tokenizer, distractor_tokens, seq_len, depth, n_trials,
                max_new_tokens, chunk_size, device, use_memory, tag, seed,
                prompt_style="continuation", value_type="numbers",
-               mk_num_keys=1, mk_num_queries=1):
+               mk_num_keys=1, mk_num_queries=1, tail_chunk_len=0):
     hits = 0
     print(f"\n=== {tag} ===")
     for t in range(n_trials):
@@ -64,6 +64,7 @@ def run_sanity(model, tokenizer, distractor_tokens, seq_len, depth, n_trials,
             eos_token_id=tokenizer.eos_token_id,
             device=device,
             use_memory=use_memory,
+            tail_chunk_len=tail_chunk_len,
         )
         pred = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
         ok = string_match_all_binary(pred, sample["refs"])
@@ -101,6 +102,9 @@ def main():
                     default="digit2")
     ap.add_argument("--mk_num_keys", type=int, default=3)
     ap.add_argument("--mk_num_queries", type=int, default=1)
+    ap.add_argument("--tail_chunk_len", type=int, default=0,
+                    help="If >0, process last N prompt tokens as a separate mini-chunk "
+                         "AFTER body is written to memory. Fixes depth=1.0.")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -126,6 +130,7 @@ def main():
         value_type=args.value_type,
         mk_num_keys=args.mk_num_keys,
         mk_num_queries=args.mk_num_queries,
+        tail_chunk_len=0,  # baseline has no memory, split is a no-op
     )
     del baseline
     torch.cuda.empty_cache()
@@ -141,6 +146,7 @@ def main():
         value_type=args.value_type,
         mk_num_keys=args.mk_num_keys,
         mk_num_queries=args.mk_num_queries,
+        tail_chunk_len=args.tail_chunk_len,
     )
     del rft
     torch.cuda.empty_cache()

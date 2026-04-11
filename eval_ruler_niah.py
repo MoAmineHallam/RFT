@@ -218,17 +218,30 @@ def generate_greedy(
     eos_token_id: Optional[int],
     device: torch.device,
     use_memory: bool,
+    tail_chunk_len: int = 0,
 ) -> List[int]:
+    """
+    tail_chunk_len: if > 0, process the last `tail_chunk_len` tokens of the prompt
+    as a separate mini-chunk AFTER the body has been written to memory. This fixes
+    the "depth=1.0" write-after-read bug where a needle in the final chunk has not
+    yet entered the memory bank when the probe runs.
+    """
     ids = torch.tensor([input_ids], dtype=torch.long, device=device)
     total_len = ids.shape[1]
     mb = MemoryBank(max_entries=65536) if use_memory else None
     if mb is not None:
         mb.reset()
 
+    # Phase 1: process body in full chunks, writing to memory
+    body_end = max(0, total_len - tail_chunk_len) if tail_chunk_len > 0 else total_len
     last_logits = None
-    for s in range(0, total_len, chunk_size):
-        e = min(total_len, s + chunk_size)
+    for s in range(0, body_end, chunk_size):
+        e = min(body_end, s + chunk_size)
         out = _forward_chunk(model, ids[:, s:e], s, use_memory, mb, True)
+        last_logits = out["logits"]
+    # Phase 2: process the tail as a single mini-chunk (memory now contains the body)
+    if body_end < total_len:
+        out = _forward_chunk(model, ids[:, body_end:total_len], body_end, use_memory, mb, True)
         last_logits = out["logits"]
     if last_logits is None:
         return []
@@ -263,6 +276,7 @@ def eval_at_depth(
     device: torch.device,
     use_memory: bool,
     prompt_style: str = "instruct",
+    tail_chunk_len: int = 0,
 ) -> Dict:
     hits = 0
     preds, refs, details = [], [], []
@@ -287,6 +301,7 @@ def eval_at_depth(
             eos_token_id=tokenizer.eos_token_id,
             device=device,
             use_memory=use_memory,
+            tail_chunk_len=tail_chunk_len,
         )
         pred = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
         ref = sample["refs"]
@@ -394,6 +409,10 @@ def main():
     ap.add_argument("--rft_ablation", type=str, choices=["none", "disable_memory", "disable_ocr"], default="none")
     ap.add_argument("--prompt_style", type=str, choices=["instruct", "continuation"], default="continuation",
                     help="continuation: bare probe for base LMs. instruct: RULER-style template.")
+    ap.add_argument("--tail_chunk_len", type=int, default=0,
+                    help="If >0, process the last N tokens of the prompt as a separate mini-chunk "
+                         "AFTER writing the body to memory. Fixes the depth=1.0 write-after-read bug. "
+                         "Typical values: 1, 4, 8, 16.")
     ap.add_argument("--outfile", type=str, default="niah_results.json")
     args = ap.parse_args()
 
@@ -450,6 +469,7 @@ def main():
                 prompt_style=args.prompt_style,
                 device=device,
                 use_memory=(args.rft_ablation != "disable_memory"),
+                tail_chunk_len=args.tail_chunk_len,
             )
             print(
                 f"    RFT-LM: {100*rft_res['accuracy']:.2f}% "
@@ -473,6 +493,7 @@ def main():
                 prompt_style=args.prompt_style,
                 device=device,
                 use_memory=False,
+                tail_chunk_len=0,  # baseline doesn't have memory, split would do nothing useful
             )
             print(
                 f"    Baseline: {100*bl_res['accuracy']:.2f}% "

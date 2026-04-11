@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from RFT_LM import BaselineTransformerLM, MemoryBank, RFTLM
+from RFT_LM import BaselineTransformerLM, MemoryBank, RFTLM, MTLM
 
 
 def string_match_all_binary(pred: str, refs: List[str]) -> bool:
@@ -357,6 +357,29 @@ def load_rft_model(path: str, device: torch.device) -> RFTLM:
     return model
 
 
+def load_mt_model(path: str, device: torch.device) -> MTLM:
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    a = ck["args"]
+    model = MTLM(
+        vocab_size=a["vocab_size"],
+        d_model=a["d_model"],
+        n_layers=a["n_layers"],
+        n_heads=a["n_heads"],
+        window_size=a["window_size"],
+        ff_mult=a["ff_mult"],
+        dropout=0.0,
+        memory_layer_idx=a["memory_layer_idx"],
+        use_memory=True,
+        mem_top_k=a["mem_top_m"],  # training flag is mem_top_m, MTLM param is mem_top_k
+    ).to(device)
+    sd = ck["model"]
+    if any(k.startswith("module.") for k in sd):
+        sd = {k.replace("module.", ""): v for k, v in sd.items()}
+    model.load_state_dict(sd, strict=False)
+    model.eval()
+    return model
+
+
 def load_baseline_model(path: str, device: torch.device) -> BaselineTransformerLM:
     ck = torch.load(path, map_location="cpu", weights_only=False)
     a = ck["args"]
@@ -388,8 +411,13 @@ def make_depth_grid(arg_depth_grid: Optional[List[float]], arg_depth: Optional[f
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rft_ckpt", type=str, required=True)
-    ap.add_argument("--baseline_ckpt", type=str, required=True)
+    ap.add_argument("--rft_ckpt", type=str, default=None,
+                    help="Path to an RFT-LM checkpoint. Mutually exclusive with --mt_ckpt.")
+    ap.add_argument("--mt_ckpt", type=str, default=None,
+                    help="Path to an MT-LM (Memorizing Transformers) checkpoint. "
+                         "Mutually exclusive with --rft_ckpt.")
+    ap.add_argument("--baseline_ckpt", type=str, default=None,
+                    help="Optional baseline checkpoint to evaluate alongside the primary model.")
     ap.add_argument("--tokenizer_path", type=str, required=True)
     ap.add_argument("--distractor_path", type=str, required=True)
     ap.add_argument("--seq_lens", type=int, nargs="+", default=[2048, 4096, 8192, 16384])
@@ -416,6 +444,12 @@ def main():
     ap.add_argument("--outfile", type=str, default="niah_results.json")
     args = ap.parse_args()
 
+    if (args.rft_ckpt is None) == (args.mt_ckpt is None):
+        ap.error("Exactly one of --rft_ckpt or --mt_ckpt must be provided.")
+    primary_kind = "rft" if args.rft_ckpt is not None else "mt"
+    primary_ckpt = args.rft_ckpt if primary_kind == "rft" else args.mt_ckpt
+    primary_label = "RFT-LM" if primary_kind == "rft" else "MT-LM"
+
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -441,19 +475,24 @@ def main():
         print(f"\n{'='*72}\n  seq_len={sl}\n{'='*72}")
         all_results[str(sl)] = {}
 
-        print("  [RFT-LM] loading...")
-        rft = load_rft_model(args.rft_ckpt, device)
-        maybe_apply_rft_ablation(rft, args.rft_ablation)
+        print(f"  [{primary_label}] loading from {primary_ckpt}")
+        if primary_kind == "rft":
+            primary = load_rft_model(primary_ckpt, device)
+            maybe_apply_rft_ablation(primary, args.rft_ablation)
+        else:
+            primary = load_mt_model(primary_ckpt, device)
 
-        print("  [Baseline] loading...")
-        baseline = load_baseline_model(args.baseline_ckpt, device)
+        baseline = None
+        if args.baseline_ckpt is not None:
+            print("  [Baseline] loading...")
+            baseline = load_baseline_model(args.baseline_ckpt, device)
 
         for depth in depths:
             depth_key = "random" if depth is None else f"{depth:.2f}"
             print(f"\n  --- depth={depth_key} ---")
 
             rft_res = eval_at_depth(
-                model=rft,
+                model=primary,
                 tokenizer=tokenizer,
                 seq_len=sl,
                 depth=depth,
@@ -472,41 +511,49 @@ def main():
                 tail_chunk_len=args.tail_chunk_len,
             )
             print(
-                f"    RFT-LM: {100*rft_res['accuracy']:.2f}% "
+                f"    {primary_label}: {100*rft_res['accuracy']:.2f}% "
                 f"[{100*rft_res['ci95_low']:.2f}, {100*rft_res['ci95_high']:.2f}]"
             )
 
-            bl_res = eval_at_depth(
-                model=baseline,
-                tokenizer=tokenizer,
-                seq_len=sl,
-                depth=depth,
-                distractor_tokens=distractor_tokens,
-                chunk_size=args.chunk_size,
-                n_trials=args.n_trials,
-                max_new_tokens=args.max_new_tokens,
-                seed=args.seed,
-                value_type=args.value_type,
-                mk_num_keys=args.mk_num_keys,
-                mk_num_values=args.mk_num_values,
-                mk_num_queries=args.mk_num_queries,
-                prompt_style=args.prompt_style,
-                device=device,
-                use_memory=False,
-                tail_chunk_len=0,  # baseline doesn't have memory, split would do nothing useful
-            )
-            print(
-                f"    Baseline: {100*bl_res['accuracy']:.2f}% "
-                f"[{100*bl_res['ci95_low']:.2f}, {100*bl_res['ci95_high']:.2f}]"
-            )
+            if baseline is not None:
+                bl_res = eval_at_depth(
+                    model=baseline,
+                    tokenizer=tokenizer,
+                    seq_len=sl,
+                    depth=depth,
+                    distractor_tokens=distractor_tokens,
+                    chunk_size=args.chunk_size,
+                    n_trials=args.n_trials,
+                    max_new_tokens=args.max_new_tokens,
+                    seed=args.seed,
+                    value_type=args.value_type,
+                    mk_num_keys=args.mk_num_keys,
+                    mk_num_values=args.mk_num_values,
+                    mk_num_queries=args.mk_num_queries,
+                    prompt_style=args.prompt_style,
+                    device=device,
+                    use_memory=False,
+                    tail_chunk_len=0,  # baseline doesn't have memory, split would do nothing useful
+                )
+                print(
+                    f"    Baseline: {100*bl_res['accuracy']:.2f}% "
+                    f"[{100*bl_res['ci95_low']:.2f}, {100*bl_res['ci95_high']:.2f}]"
+                )
+                all_results[str(sl)][depth_key] = {
+                    "rft_lm": rft_res,
+                    "baseline": bl_res,
+                    "delta_acc": rft_res["accuracy"] - bl_res["accuracy"],
+                }
+            else:
+                all_results[str(sl)][depth_key] = {
+                    "rft_lm": rft_res,
+                    "baseline": None,
+                    "delta_acc": None,
+                }
 
-            all_results[str(sl)][depth_key] = {
-                "rft_lm": rft_res,
-                "baseline": bl_res,
-                "delta_acc": rft_res["accuracy"] - bl_res["accuracy"],
-            }
-
-        del rft, baseline
+        del primary
+        if baseline is not None:
+            del baseline
         torch.cuda.empty_cache()
 
     print(f"\n{'='*72}\n  HEATMAP TABLE (accuracy %)\n{'='*72}")
@@ -515,24 +562,31 @@ def main():
         for depth in depths:
             key = "random" if depth is None else f"{depth:.2f}"
             rec = all_results[str(sl)][key]
-            row.append(
-                f"d={key}: RFT {100*rec['rft_lm']['accuracy']:.1f} | "
-                f"Base {100*rec['baseline']['accuracy']:.1f}"
-            )
+            cell = f"d={key}: {primary_label} {100*rec['rft_lm']['accuracy']:.1f}"
+            if rec["baseline"] is not None:
+                cell += f" | Base {100*rec['baseline']['accuracy']:.1f}"
+            row.append(cell)
         print(f"  L={sl}: " + " || ".join(row))
 
     print("\n[NOTE] For fair paper framing, compare against published Titans/Mamba numbers externally using matching task config.")
 
-    out_dir = str(Path(args.rft_ckpt).resolve().parent.parent)
+    out_dir = str(Path(primary_ckpt).resolve().parent.parent)
     out_path = os.path.join(out_dir, args.outfile)
+
+    def _strip_details(rec):
+        if rec is None:
+            return None
+        return {k: v for k, v in rec.items() if k != "details"}
 
     summary = {
         "config": vars(args),
+        "primary_kind": primary_kind,
+        "primary_label": primary_label,
         "results": {
             sl: {
                 d: {
-                    "rft_lm": {k: v for k, v in rec["rft_lm"].items() if k != "details"},
-                    "baseline": {k: v for k, v in rec["baseline"].items() if k != "details"},
+                    "rft_lm": _strip_details(rec["rft_lm"]),
+                    "baseline": _strip_details(rec["baseline"]),
                     "delta_acc": rec["delta_acc"],
                 }
                 for d, rec in depth_map.items()

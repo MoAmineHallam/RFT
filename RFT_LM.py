@@ -650,12 +650,19 @@ class MTMemoryLayer(nn.Module):
         q = self.mem_q(x)  # [B, L, D]
         scores = torch.einsum("bld,bnd->bln", q, memory_keys) / math.sqrt(D)  # [B, L, N_mem]
 
+        # Guard against NaN/Inf from diverged models — topk on NaN produces
+        # garbage indices that cause CUDA OOB in the gather below.
+        scores = scores.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+
         top_scores, top_idx = torch.topk(scores, k=K, dim=-1)  # [B, L, K]
 
-        # Gather candidate values per batch
-        cand_vals = torch.zeros(B, L, K, D, device=x.device, dtype=memory_vals.dtype)
-        for b in range(B):
-            cand_vals[b] = memory_vals[b][top_idx[b]]
+        # Clamp indices as a safety net (should be no-op when scores are clean)
+        top_idx = top_idx.clamp(0, N_mem - 1)
+
+        # Gather candidate values — use expand + gather for robustness
+        idx_expanded = top_idx.unsqueeze(-1).expand(B, L, K, D)  # [B, L, K, D]
+        mem_vals_exp = memory_vals.unsqueeze(1).expand(B, L, N_mem, D)  # [B, L, N_mem, D]
+        cand_vals = torch.gather(mem_vals_exp, dim=2, index=idx_expanded)  # [B, L, K, D]
 
         attn_weights = F.softmax(top_scores, dim=-1).unsqueeze(-1)  # [B, L, K, 1]
         retrieved = (attn_weights * cand_vals).sum(dim=2)  # [B, L, D]

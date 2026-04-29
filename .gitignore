@@ -1,0 +1,60 @@
+# Checkpoints
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# Training output directories (broad catch-all for *_seed* folders)
+*_seed*/
+pretrain_*/
+mixed_pilot_*/
+rft_finetuned_*/
+rft_final_*/
+matched_baseline_*/
+mt_lm_noalign_*/
+perfect_niah_model_*/
+working_niah_model_*/
+*_backup/
+_consolidated_results/
+
+# Data
+data/
+*.jsonl
+PaulGrahamEssays.json
+PaulGrahamEssays_URLs.txt
+english_words.json
+
+# Logs
+logs/
+*.log
+nohup.out
+experiment_log.txt
+rftlm_log.txt
+
+# Jupyter copies
+*-Copy*.ipynb
+*-Copy*.py
+*-Copy*.sh
+
+# Backups
+*.bad
+*.bak
+*.v*_backup
+
+# Tokenizer (re-downloadable)
+gpt2_tokenizer/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Env / editor
+.env
+.vscode/
+.idea/
+*.swp
+.DS_Store

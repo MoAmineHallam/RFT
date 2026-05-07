@@ -27,6 +27,10 @@ def main():
     ap.add_argument("--mem_top_m", type=int, default=64)
     ap.add_argument("--ocr_dim", type=int, default=256)
     ap.add_argument("--mem_gate_alpha_init", type=float, default=1.0)
+    ap.add_argument("--unfreeze_from_layer", type=int, default=-1,
+                    help="If >=0, unfreeze base layers from this index onward "
+                         "(plus final norm + lm_head + embed). Set to memory_layer_idx "
+                         "so post-memory pathway can adapt to mem_ctx.")
     ap.add_argument("--chunk_size", type=int, default=512)
     ap.add_argument("--batch_size", type=int, default=2)
     ap.add_argument("--steps", type=int, default=4000)
@@ -63,6 +67,7 @@ def main():
         ocr_dim=args.ocr_dim,
         mem_gate_alpha_init=args.mem_gate_alpha_init,
         freeze_base=True,
+        unfreeze_from_layer=args.unfreeze_from_layer,
     ).to(device)
     model.train()
 
@@ -142,9 +147,12 @@ def main():
                 f.write(json.dumps({"step": step, **m}) + "\n")
 
         if (step + 1) % args.save_every == 0 or (step + 1) == args.steps:
-            # Save only trainable bits (base is reloaded from HF on eval)
+            # Save trainable params only (frozen base will be reloaded from HF on eval).
+            trainable_names = {
+                n for n, p in model.named_parameters() if p.requires_grad
+            }
             trainable_state = {
-                k: v for k, v in model.state_dict().items() if not k.startswith("base.")
+                k: v for k, v in model.state_dict().items() if k in trainable_names
             }
             ckpt = os.path.join(args.outdir, f"checkpoint_step{step+1}.pt")
             torch.save({"model": trainable_state, "args": vars(args), "step": step + 1}, ckpt)

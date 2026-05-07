@@ -19,6 +19,7 @@ class RFTGraftLM(nn.Module):
         ocr_dim: int = 256,
         mem_gate_alpha_init: float = 1.0,
         freeze_base: bool = True,
+        unfreeze_from_layer: int = -1,
         torch_dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
@@ -64,6 +65,16 @@ class RFTGraftLM(nn.Module):
         if freeze_base:
             for p in self.base.parameters():
                 p.requires_grad = False
+            if unfreeze_from_layer >= 0:
+                for j in range(unfreeze_from_layer, len(self._layers)):
+                    for p in self._layers[j].parameters():
+                        p.requires_grad = True
+                for p in self._final_norm.parameters():
+                    p.requires_grad = True
+                for p in self._lm_head.parameters():
+                    p.requires_grad = True
+                for p in self._embed.parameters():
+                    p.requires_grad = True
 
     # Aliases so niah_batch.py code finds what it expects
     @property

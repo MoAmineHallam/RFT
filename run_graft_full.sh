@@ -21,11 +21,11 @@ python "$SCRIPT_DIR/train_graft.py" \
     --base Qwen/Qwen2.5-0.5B \
     --data_path "$DATA" \
     --outdir "$OUT" \
-    --memory_layer_idx 12 \
+    --memory_layer_idx 12 --unfreeze_from_layer 12 \
     --mem_top_m 64 --ocr_dim 256 \
     --mem_gate_alpha_init 1.0 \
     --chunk_size 512 --batch_size 2 \
-    --steps 8000 --warmup 300 --lr 1e-4 \
+    --steps 8000 --warmup 300 --lr 5e-5 \
     --niah_value_type numbers --niah_max_val_tokens 8 \
     --niah_num_needles 3 \
     --niah_distractor_docs 300 \

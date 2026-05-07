@@ -414,6 +414,7 @@ def load_graft_model(path: str, device: torch.device, base_override: str = None)
         ocr_dim=a["ocr_dim"],
         mem_gate_alpha_init=a.get("mem_gate_alpha_init", 1.0),
         freeze_base=True,
+        unfreeze_from_layer=a.get("unfreeze_from_layer", -1),
     ).to(device)
     sd = ck["model"]
     if any(k.startswith("module.") for k in sd):

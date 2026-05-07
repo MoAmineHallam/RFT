@@ -32,7 +32,7 @@ for VAL in numbers short_int digit2; do
             --needle_depth_grid 0.0 0.25 0.5 0.75 1.0 \
             --value_type "$VAL" \
             --mk_num_keys 3 --mk_num_values 1 --mk_num_queries 1 \
-            --prompt_style instruct --tail_chunk_len 8 \
+            --prompt_style continuation --tail_chunk_len 8 \
             --n_trials 100 --max_new_tokens 16 \
             --outfile "$OUT/graft_${VAL}_L${SEQ}.json" \
             2>&1 | tee "$OUT/graft_${VAL}_L${SEQ}.log"
@@ -51,7 +51,7 @@ for VAL in numbers short_int digit2; do
             --needle_depth_grid 0.0 0.25 0.5 0.75 1.0 \
             --value_type "$VAL" \
             --mk_num_keys 3 --mk_num_values 1 --mk_num_queries 1 \
-            --prompt_style instruct \
+            --prompt_style continuation \
             --n_trials 100 --max_new_tokens 16 \
             --outfile "$OUT/vanilla_${VAL}_L${SEQ}.json" \
             2>&1 | tee "$OUT/vanilla_${VAL}_L${SEQ}.log"

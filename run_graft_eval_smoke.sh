@@ -25,7 +25,7 @@ for VAL in numbers short_int digit2; do
         --seq_lens 1024 --needle_depth 0.5 \
         --value_type "$VAL" \
         --mk_num_keys 3 --mk_num_values 1 --mk_num_queries 1 \
-        --prompt_style instruct --tail_chunk_len 8 \
+        --prompt_style continuation --tail_chunk_len 8 \
         --n_trials 50 --max_new_tokens 16 \
         --outfile "graft_smoke_${VAL}_L1024.json" \
         2>&1 | tee "$ROOT/graft_qwen05b_smoke/eval_${VAL}.log"

@@ -96,6 +96,13 @@ class RFTGraftLM(nn.Module):
             return None
         return self._rotary(hidden, position_ids)
 
+    def _build_causal_mask(self, B, L, dtype, device):
+        if L == 1:
+            return torch.zeros((B, 1, 1, 1), dtype=dtype, device=device)
+        mask = torch.full((L, L), torch.finfo(dtype).min, dtype=dtype, device=device)
+        mask = torch.triu(mask, diagonal=1)
+        return mask.unsqueeze(0).unsqueeze(0).expand(B, 1, L, L)
+
     def forward(
         self,
         input_ids,
@@ -117,9 +124,10 @@ class RFTGraftLM(nn.Module):
         new_mem_keys = None
         new_mem_vals = None
 
+        causal_mask = self._build_causal_mask(B, x.shape[1], x.dtype, device)
         for i, layer in enumerate(self._layers):
             kwargs = dict(
-                attention_mask=None,
+                attention_mask=causal_mask,
                 position_ids=position_ids,
                 past_key_value=None,
                 output_attentions=False,
@@ -132,7 +140,7 @@ class RFTGraftLM(nn.Module):
             except TypeError:
                 out = layer(
                     x,
-                    attention_mask=None,
+                    attention_mask=causal_mask,
                     position_ids=position_ids,
                     past_key_value=None,
                     output_attentions=False,
@@ -175,9 +183,10 @@ class RFTGraftLM(nn.Module):
         x_at_mem = None
         mem_ctx = None
 
+        causal_mask = self._build_causal_mask(B, x.shape[1], x.dtype, device)
         for i, layer in enumerate(self._layers):
             kwargs = dict(
-                attention_mask=None,
+                attention_mask=causal_mask,
                 position_ids=position_ids,
                 past_key_value=None,
                 output_attentions=False,
@@ -190,7 +199,7 @@ class RFTGraftLM(nn.Module):
             except TypeError:
                 out = layer(
                     x,
-                    attention_mask=None,
+                    attention_mask=causal_mask,
                     position_ids=position_ids,
                     past_key_value=None,
                     output_attentions=False,

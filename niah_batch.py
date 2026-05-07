@@ -239,22 +239,27 @@ def niah_retrieval_step(
 
     # ── Chunk 1: manual forward, capturing hidden states at memory layer
     model = raw_model
-    x = model.embed(qry_chunk) * model.embed_scale
-    x = model.drop(x)
-    rope_cos, rope_sin = model.rope(L1, offset=L0)
+    if hasattr(model, "forward_manual"):
+        x_at_mem, mem_ctx, logits = model.forward_manual(
+            qry_chunk, mem_k, mem_v, mem_pos, L0
+        )
+    else:
+        x = model.embed(qry_chunk) * model.embed_scale
+        x = model.drop(x)
+        rope_cos, rope_sin = model.rope(L1, offset=L0)
 
-    x_at_mem = None
-    mem_ctx = None
-    for i, layer in enumerate(model.layers):
-        x = layer(x, rope_cos, rope_sin, L0)
-        if i == model.memory_layer_idx:
-            x_at_mem = x
-            if model.use_memory and mem_k is not None and mem_k.shape[1] > 0:
-                mem_ctx = model.memory_layer(x, mem_k, mem_v, mem_pos, L0)
-                x = x + mem_ctx
+        x_at_mem = None
+        mem_ctx = None
+        for i, layer in enumerate(model.layers):
+            x = layer(x, rope_cos, rope_sin, L0)
+            if i == model.memory_layer_idx:
+                x_at_mem = x
+                if model.use_memory and mem_k is not None and mem_k.shape[1] > 0:
+                    mem_ctx = model.memory_layer(x, mem_k, mem_v, mem_pos, L0)
+                    x = x + mem_ctx
 
-    x = model.ln_f(x)
-    logits = model.lm_head(x)  # [B, L1, vocab]
+        x = model.ln_f(x)
+        logits = model.lm_head(x)  # [B, L1, vocab]
 
     # ── Full-sequence LM loss across every value token position ─────
     # val_positions: [B, K], val_targets: [B, K] with -100 for padding.
@@ -386,20 +391,25 @@ def mt_niah_retrieval_step(
 
     # Chunk 1: manual forward, capturing mem_ctx at the memory layer
     model = raw_model
-    x = model.embed(qry_chunk) * model.embed_scale
-    x = model.drop(x)
-    rope_cos, rope_sin = model.rope(L1, offset=L0)
+    if hasattr(model, "forward_manual"):
+        _x_at_mem, mem_ctx, logits = model.forward_manual(
+            qry_chunk, mem_k, mem_v, mem_pos, L0
+        )
+    else:
+        x = model.embed(qry_chunk) * model.embed_scale
+        x = model.drop(x)
+        rope_cos, rope_sin = model.rope(L1, offset=L0)
 
-    mem_ctx = None
-    for i, layer in enumerate(model.layers):
-        x = layer(x, rope_cos, rope_sin, L0)
-        if i == model.memory_layer_idx:
-            if model.use_memory and mem_k is not None and mem_k.shape[1] > 0:
-                mem_ctx = model.memory_layer(x, mem_k, mem_v, mem_pos, L0)
-                x = x + mem_ctx
+        mem_ctx = None
+        for i, layer in enumerate(model.layers):
+            x = layer(x, rope_cos, rope_sin, L0)
+            if i == model.memory_layer_idx:
+                if model.use_memory and mem_k is not None and mem_k.shape[1] > 0:
+                    mem_ctx = model.memory_layer(x, mem_k, mem_v, mem_pos, L0)
+                    x = x + mem_ctx
 
-    x = model.ln_f(x)
-    logits = model.lm_head(x)  # [B, L1, vocab]
+        x = model.ln_f(x)
+        logits = model.lm_head(x)  # [B, L1, vocab]
 
     # Full-sequence LM loss across every value token position
     K = val_positions.shape[1]

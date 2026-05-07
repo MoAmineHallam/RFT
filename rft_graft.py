@@ -160,3 +160,50 @@ class RFTGraftLM(nn.Module):
             out["new_mem_keys"] = new_mem_keys
             out["new_mem_vals"] = new_mem_vals
         return out
+
+    def forward_manual(self, qry_chunk, mem_k, mem_v, mem_pos, pos_offset: int):
+        """Manual layer-by-layer forward used by niah_retrieval_step.
+
+        Returns (x_at_mem, mem_ctx, logits). HF-compatible layer call.
+        """
+        B, L1 = qry_chunk.shape
+        device = qry_chunk.device
+        x = self._embed(qry_chunk) * self.embed_scale
+        position_ids = self._build_position_ids(B, L1, pos_offset, device)
+        position_embeddings = self._build_position_embeddings(x, position_ids)
+
+        x_at_mem = None
+        mem_ctx = None
+
+        for i, layer in enumerate(self._layers):
+            kwargs = dict(
+                attention_mask=None,
+                position_ids=position_ids,
+                past_key_value=None,
+                output_attentions=False,
+                use_cache=False,
+            )
+            if position_embeddings is not None:
+                kwargs["position_embeddings"] = position_embeddings
+            try:
+                out = layer(x, **kwargs)
+            except TypeError:
+                out = layer(
+                    x,
+                    attention_mask=None,
+                    position_ids=position_ids,
+                    past_key_value=None,
+                    output_attentions=False,
+                    use_cache=False,
+                )
+            x = out[0] if isinstance(out, tuple) else out
+
+            if i == self.memory_layer_idx:
+                x_at_mem = x
+                if self.use_memory and mem_k is not None and mem_k.shape[1] > 0:
+                    mem_ctx = self.memory_layer(x, mem_k, mem_v, mem_pos, pos_offset)
+                    x = x + mem_ctx
+
+        x = self._final_norm(x)
+        logits = self._lm_head(x)
+        return x_at_mem, mem_ctx, logits

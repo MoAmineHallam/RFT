@@ -29,7 +29,7 @@ python "$SCRIPT_DIR/train_graft.py" \
     --niah_value_type numbers --niah_max_val_tokens 8 \
     --niah_num_needles 3 \
     --niah_distractor_docs 300 \
-    --niah_lm_w 3.0 --niah_decode_w 10.0 \
+    --niah_lm_w 5.0 --niah_decode_w 0.0 \
     --niah_router_w 1.0 --niah_topm_w 0.25 \
     --niah_pointer_w 0.5 --niah_ocr_w 0.2 \
     --save_every 1000 --log_every 50 \

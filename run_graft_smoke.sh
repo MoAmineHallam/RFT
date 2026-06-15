@@ -17,6 +17,8 @@ mkdir -p "$OUT"
 
 echo "================================================================"
 echo "  GRAFT SMOKE — Qwen2.5-0.5B + RFT memory operator (1000 steps)"
+echo "  Value type: digit2 (1-2 BPE tokens) — achievable full_match in 1k steps"
+echo "  Pass criterion: niah_lm_full_match > 0.10 by step 1000"
 echo "================================================================"
 
 python "$SCRIPT_DIR/train_graft.py" \
@@ -28,10 +30,10 @@ python "$SCRIPT_DIR/train_graft.py" \
     --mem_gate_alpha_init 1.0 \
     --chunk_size 512 --batch_size 2 \
     --steps 1000 --warmup 100 --lr 1e-4 \
-    --niah_value_type numbers --niah_max_val_tokens 8 \
-    --niah_num_needles 3 \
-    --niah_distractor_docs 300 \
-    --niah_lm_w 3.0 --niah_decode_w 10.0 \
+    --niah_value_type digit2 --niah_max_val_tokens 4 \
+    --niah_num_needles 1 \
+    --niah_distractor_docs 100 \
+    --niah_lm_w 5.0 --niah_decode_w 0.0 \
     --niah_router_w 1.0 --niah_topm_w 0.25 \
     --niah_pointer_w 0.5 --niah_ocr_w 0.2 \
     --save_every 500 --log_every 20 \

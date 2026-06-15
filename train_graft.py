@@ -138,6 +138,7 @@ def main():
         if step % args.log_every == 0:
             tps = (step + 1) * args.batch_size * args.chunk_size * 2 / max(1, time.time() - t0)
             print(f"  step {step:6d} | loss {loss_val:7.3f} "
+                  f"| lm_ce {m['niah_lm_ce']:6.3f} "
                   f"| lm_acc {m['niah_lm_acc']:.3f} "
                   f"| full {m['niah_lm_full_match']:.3f} "
                   f"| emb {m['niah_embed_acc']:.3f} "

@@ -420,8 +420,13 @@ def load_graft_model(path: str, device: torch.device, base_override: str = None)
     if any(k.startswith("module.") for k in sd):
         sd = {k.replace("module.", ""): v for k, v in sd.items()}
     missing, unexpected = model.load_state_dict(sd, strict=False)
-    # base.* keys are expected to be missing — they're loaded from HF
-    real_missing = [k for k in missing if not k.startswith("base.")]
+    # base.* keys are expected to be missing — they're loaded from HF.
+    # _layers/_embed/_final_norm/_lm_head/_rotary are ALIASES of base.* submodules
+    # (same tensors registered under a second name); loading base.* fills them,
+    # so listing them as "missing" is a false alarm.
+    real_missing = [k for k in missing
+                    if not k.startswith(("base.", "_layers.", "_embed.",
+                                         "_final_norm.", "_lm_head.", "_rotary."))]
     if real_missing:
         print(f"[GRAFT] WARNING missing trainable keys: {real_missing[:5]}")
     if unexpected:

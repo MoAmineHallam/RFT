@@ -283,6 +283,12 @@ def niah_retrieval_step(
         # Per-example full-match: ALL valid positions correct
         per_ex_correct = (per_pos_correct.sum(dim=1) == valid.sum(dim=1).clamp(min=1))
         lm_full_match_acc = per_ex_correct.float().mean()
+        # Token-0 accuracy: the ONLY position where memory content is required.
+        # Positions >=1 are teacher-forced digit continuations whose ground-truth
+        # prefixes are visible in the input, so lm_acc overstates retrieval.
+        first_valid = valid[:, 0]
+        first_tok_acc = ((per_pos_correct[:, 0] & first_valid).sum().float()
+                         / first_valid.sum().clamp(min=1).float())
 
     # ── Embedding alignment loss (only at first value position) ─────
     # Memory retrieval is most critical at position 0 (the "is" token).
@@ -337,6 +343,7 @@ def niah_retrieval_step(
         "niah_lm_ce": float(lm_loss.item()),
         "niah_lm_acc": float(lm_acc.item()),                 # per-token (first-tok-equivalent if K=1)
         "niah_lm_full_match": float(lm_full_match_acc.item()),  # ALL value tokens correct (TF)
+        "niah_first_tok_acc": float(first_tok_acc.item()),   # token-0 only: the true retrieval metric
         "niah_embed_loss": float(embed_loss.item()),
         "niah_embed_acc": float(embed_acc.item()),
         "niah_router_ce": float(ret["router_ce"].item()),
@@ -429,6 +436,9 @@ def mt_niah_retrieval_step(
         lm_acc = per_pos_correct.sum().float() / valid.sum().clamp(min=1).float()
         per_ex_correct = (per_pos_correct.sum(dim=1) == valid.sum(dim=1).clamp(min=1))
         lm_full_match_acc = per_ex_correct.float().mean()
+        first_valid = valid[:, 0]
+        first_tok_acc = ((per_pos_correct[:, 0] & first_valid).sum().float()
+                         / first_valid.sum().clamp(min=1).float())
 
     # Embedding alignment loss (Gate 1A knob), only at first value position
     batch_idx_1d = torch.arange(B, device=device)
@@ -463,6 +473,7 @@ def mt_niah_retrieval_step(
         "niah_lm_ce": float(lm_loss.item()),
         "niah_lm_acc": float(lm_acc.item()),
         "niah_lm_full_match": float(lm_full_match_acc.item()),
+        "niah_first_tok_acc": float(first_tok_acc.item()),
         "niah_embed_loss": float(embed_loss.item()),
         "niah_embed_acc": float(embed_acc.item()),
         "niah_router_ce": 0.0,

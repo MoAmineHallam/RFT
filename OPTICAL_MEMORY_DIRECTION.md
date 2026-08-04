@@ -126,7 +126,32 @@ is the exact hypothesis we carry into optical), then open RAOC as the flagship.
   carry the paper if C is null.
 - **Scope discipline:** A is the anchor. Do A first, fully. B/C build on it.
 
-## 7. First concrete steps
+## 6b. PRIOR-WORK VERDICT (July 23, 2026) — DO NOT PIVOT
+
+A novelty search found the optical/visual context-compression + retrieval space
+is crowded and moving fast (Apple, DeepSeek, others; papers as recent as
+2 months old). All three contributions above are done or imminently at risk:
+
+- **A (NIAH over optical)**: SCOOPED. "Text or Pixels? It Takes Half"
+  (arXiv:2510.18279) ran RULER NIAH over rendered text (99% @ ρ≈2).
+  DeepSeek-OCR-2 (Jan 2026) already shipped; NIAH is the authors' own next step.
+- **B (query-aware keep-relevant-sharp)**: SCOOPED by LensVLM (arXiv:2605.07019,
+  Apple, May 2026) — selective on-demand expansion of relevant compressed
+  images; full-text accuracy at 4.3×, beats baselines to 10.1×.
+- **C (needles lost first under compression)**: the core hypothesis is already
+  published for text gist tokens (arXiv:2412.17483). Alignment-at-decoder is the
+  only sliver left, and it rests on A/B, which are gone.
+
+**Decision: do not pivot to optical.** Cannot out-run Apple/DeepSeek from 10
+months behind on 2 V100s. What survives as genuinely ours is the *diagnostic
+lens*, not a compression method: none of these papers separate retrieval
+(did info survive?) from decoding (could the model read it?). Fold the optical
+angle into the 125M paper as ONE discussion paragraph ("the same gap governs
+compressed-vision memory; methods like LensVLM fight decodability without
+diagnosing it") — cite the field, do not join it. Return to finishing the
+125M mechanism paper, which is nearly done and far less crowded in its framing.
+
+## 7. First concrete steps  (SUPERSEDED by 6b — retained for record)
 
 1. Grab DeepSeek-OCR open weights + its render/encode path; reproduce one
    reconstruction number (sanity that the pipeline runs on our box).

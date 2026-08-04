@@ -19,29 +19,52 @@ three separable conditions, and prior work conflates them:
 |---|---|---|
 | **C1. Correct retrieval** | memory returns the wrong content | MT kNN baseline: floor (2–4%), alignment cannot rescue it |
 | **C2. Trainable readout** | nothing downstream can use the memory | Qwen-0.5B graft: r@M **1.000**, answer **0%** |
-| **C3. Decodable representation** | retrieved vector is not in output-embedding space | v6 vs no-align alignment trajectory |
+| **C3. Sufficient memory signal** | memory is added but too attenuated to change the output | gate-init ablation `[PENDING]`; v5 (gate 0.1) 54–61% vs v6 (gate 1.0) 88–91% |
 
 The headline system satisfies all three: **88.0 ± 5.2%** RULER S-NIAH across
 3 seeds vs **0%** base LM and **0–2%** memory-ablated.
 
 ## Key mechanistic claim (the interesting part)
 
-With **tied embeddings**, `lm_head` is the embedding matrix transposed, so
-"make the retrieved vector resemble the target token's embedding" is the path
-of least resistance for the LM objective. Consequently:
+### The alignment loss is NOT the unlock — a self-correction the paper should own
 
-- Alignment **emerges on its own** from LM loss once retrieval is correct
-  (decode_w=0 run: emb_loss 11.8 → 2.86 by epoch 11, emb_acc 0 → 1.0).
-- The explicit alignment loss does not teach a new capability — it
-  **accelerates and tightens** alignment by ~100× (v6: emb_loss **0.016**).
-- It cannot help at all when C1 fails (MT: emb_loss stuck ~6.7, emb_acc 0) —
+The project's prior framing (`session_handoff.md`, PAPER_PLAN v1) held that the
+embedding-alignment loss was *the* contribution. **A controlled ablation refutes
+this.** Training v6's exact recipe with `decode_w = 0`:
+
+| | eval d=0.0 | eval d=0.5 | epochs |
+|---|---|---|---|
+| v6 seed 42 (**with** alignment) | 98 | 97 | 40 |
+| no-align (`decode_w=0`) | **99** | **95** | **11** |
+
+The ablated model matches the full model with <1/3 the training. Explicit
+alignment is unnecessary.
+
+**Why**: with **tied embeddings**, `lm_head` *is* the embedding matrix
+transposed, so "make the retrieved vector resemble the target token's
+embedding" is the path of least resistance for the LM objective itself.
+Alignment therefore **emerges for free** once retrieval is correct —
+with `decode_w=0`, emb_loss fell 11.8 → 2.86 and emb_acc 0 → 1.0 by epoch 11.
+The explicit loss only tightens it (~100×: v6 emb_loss 0.016) without buying
+end-task accuracy.
+
+Alignment also cannot rescue a system missing the other conditions:
+- **¬C1** (MT, no supervised routing): emb_loss stuck ~6.7, emb_acc 0 —
   aligning a wrongly-retrieved vector is meaningless.
-- It cannot help when C2 fails (graft: frozen readout, alignment target
-  satisfiable in isolation — emb_acc 1.0 — yet 0% end-to-end).
+- **¬C2** (graft, frozen readout): alignment target satisfiable in isolation
+  (emb_acc 1.0) yet 0% end-to-end.
 
-`[PENDING]` whether tighter alignment buys **eval** accuracy (v6 vs no-align
-at epoch 40) → decides whether C3's explicit loss is a *requirement* or an
-*accelerator*. Both are publishable; the sentence differs.
+### What the unlock actually is
+
+v5 → v6 changed three things at once (decode_w 5→10, gate_init 0.1→1.0,
+epochs 20→40). `decode_w` is now eliminated. The prime suspect is **gate init**:
+`tanh(0.1) ≈ 0.10` vs `tanh(1.0) ≈ 0.76` — a **7.6× increase in memory signal
+strength** into the residual stream, which matches the project's original
+"signal attenuation" diagnosis of the gap.
+
+`[PENDING]` gate-init ablation (v6 recipe, `mem_gate_alpha_init=0.1`, seed 42).
+Collapse toward v5's ~55% ⇒ gate init is the mechanism. Stays ~90% ⇒ training
+length was the story.
 
 ## Sections
 

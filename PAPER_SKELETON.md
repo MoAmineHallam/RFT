@@ -54,17 +54,38 @@ Alignment also cannot rescue a system missing the other conditions:
 - **¬C2** (graft, frozen readout): alignment target satisfiable in isolation
   (emb_acc 1.0) yet 0% end-to-end.
 
-### What the unlock actually is
+### What the unlock actually is: only the memory itself
 
-v5 → v6 changed three things at once (decode_w 5→10, gate_init 0.1→1.0,
-epochs 20→40). `decode_w` is now eliminated. The prime suspect is **gate init**:
-`tanh(0.1) ≈ 0.10` vs `tanh(1.0) ≈ 0.76` — a **7.6× increase in memory signal
-strength** into the residual stream, which matches the project's original
-"signal attenuation" diagnosis of the gap.
+**Final controlled ablation table** — seed 42, 40 epochs, identical current
+code, identical eval (digit2, 3 keys, continuation, tail=8, n=100/cell):
 
-`[PENDING]` gate-init ablation (v6 recipe, `mem_gate_alpha_init=0.1`, seed 42).
-Collapse toward v5's ~55% ⇒ gate init is the mechanism. Stays ~90% ⇒ training
-length was the story.
+| Config | L=2048 | L=4096 | L=8192 | mean |
+|---|---|---|---|---|
+| v6 full (gate 1.0, decode 10) | 94.0 | 90.6 | 93.6 | **92.7** |
+| − alignment (decode_w = 0) | 92.0 | 93.8 | 94.6 | **93.5** |
+| gate init 0.1 (7.6× weaker signal) | 94.0 | 92.8 | 94.4 | **93.7** |
+| **− memory (same ckpt, flag off)** | **0.0** | **0.0** | **0.0** | **0.0** |
+
+All three training configs fall within ~1pp. **Neither the alignment loss nor
+the gate init contributes anything.** Disabling memory sends the identical
+checkpoint to exactly 0.0% in every cell.
+
+Additional eliminations:
+- **Training length**: performance saturates by epoch ~11 (mid-checkpoint
+  99/95 vs epoch-40 98/96).
+- **Code version**: April v6 seed 42 = 91.5 vs current-code rerun = 92.7 (~1pp).
+- **Tail-chunk fix**: at d≤0.5 it changes nothing (100/100 without vs 99/99
+  with, at 2048). It matters only at d=1.0, as designed.
+
+**Therefore the v5→v6 comparison is dropped.** v5 was a single exploratory run
+under older code with three hyperparameters differing at once; each has since
+been tested individually and shown to be inert. Attributing the historical gain
+to any of them would be unsupportable. The paper reports only the controlled
+table above.
+
+**What remains as the contribution**: supervised sparse retrieval + a trainable
+readout. No auxiliary alignment objective, no gate tuning. The method is
+simpler than originally believed.
 
 ## Sections
 
@@ -135,8 +156,22 @@ no-align 2/4/4%, +align 0/0/0% at d=0.0/0.25/0.5 → both floor.
 
 ## Open cells
 
-- `[PENDING]` v6-no-align full eval @ epoch 40 → C3 requirement vs accelerator.
 - `[PENDING]` perplexity sanity (memory training doesn't wreck LM quality).
+- `[OPTIONAL]` one non-synthetic long-context task (LongBench PassageRetrieval)
+  — the single highest-value addition for a main-conference submission.
+
+Everything else in the experimental core is **complete**.
+
+## Headline numbers (final)
+
+- **93.5%** mean RULER S-NIAH (2K–8K × 5 depths) vs **0.0%** with memory
+  disabled — same checkpoint, one flag.
+- **100%** at 8K on 4 of 5 depths; accuracy *increases* with context length,
+  trained at 2K.
+- 3 seeds of the full recipe: 91.5 / 90.5 / 82.1 → **88.0 ± 5.2**.
+- Multi-needle (4 keys): 85–91%, graceful.
+- **d=0.75 = 71–75% in all six configurations ever run** → hard architectural
+  boundary effect, not variance. Deserves its own analysis paragraph.
 
 ## Venue
 

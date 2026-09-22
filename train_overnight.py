@@ -359,7 +359,8 @@ def train_rft_lm(
             chunk_size=args.chunk_size,
             batch_size=args.niah_batch_size,
             num_needles=args.niah_num_needles,
-            value_type="digit2",
+            value_type=args.niah_value_type,
+            max_val_tokens=args.niah_max_val_tokens,
         )
         niah_gen = NIAHBatchGen(
             niah_cfg, niah_tokenizer, niah_dist_tokens,
@@ -369,6 +370,7 @@ def train_rft_lm(
             print(f"[NIAH] natural-language NIAH ON: ratio {args.niah_ratio:.2f}->"
                   f"{args.niah_ratio_end:.2f}, bs={args.niah_batch_size} "
                   f"needles={args.niah_num_needles} dist_toks={len(niah_dist_tokens):,}")
+            print(f"[NIAH] value_type={args.niah_value_type} max_val_tokens={args.niah_max_val_tokens}")
             print(f"[NIAH] loss weights: lm={args.niah_lm_w} decode={args.niah_decode_w} "
                   f"router={args.niah_router_w} topm={args.niah_topm_w} "
                   f"ptr={args.niah_pointer_w} ocr={args.niah_ocr_w}")
@@ -723,6 +725,12 @@ def main():
     ap.add_argument("--niah_loss_scale", type=float, default=1.0)
     ap.add_argument("--niah_batch_size", type=int, default=4)
     ap.add_argument("--niah_num_needles", type=int, default=3)
+    ap.add_argument("--niah_value_type", type=str,
+                    choices=["digit2", "short_int", "numbers"], default="digit2",
+                    help="Value distribution. digit2=10-99 (1 BPE), "
+                         "short_int=100-999 (~1-2 BPE), numbers=7-digit (~3 BPE).")
+    ap.add_argument("--niah_max_val_tokens", type=int, default=8,
+                    help="Cap on supervised BPE tokens per value (full-sequence loss).")
     ap.add_argument("--niah_lm_w", type=float, default=2.0,
                     help="Weight for LM loss at probe position in NIAH steps.")
     ap.add_argument("--niah_decode_w", type=float, default=5.0,

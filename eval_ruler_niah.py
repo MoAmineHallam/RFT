@@ -400,6 +400,41 @@ def load_baseline_model(path: str, device: torch.device) -> BaselineTransformerL
     return model
 
 
+def load_graft_model(path: str, device: torch.device, base_override: str = None):
+    """Load an RFTGraftLM checkpoint. Saved checkpoint contains only trainable
+    parameters (memory layer + projections); the HF base is reloaded fresh."""
+    from rft_graft import RFTGraftLM
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    a = ck["args"]
+    base = base_override or a.get("base", "Qwen/Qwen2.5-0.5B")
+    model = RFTGraftLM(
+        base_model_name=base,
+        memory_layer_idx=a["memory_layer_idx"],
+        mem_top_m=a["mem_top_m"],
+        ocr_dim=a["ocr_dim"],
+        mem_gate_alpha_init=a.get("mem_gate_alpha_init", 1.0),
+        freeze_base=True,
+        unfreeze_from_layer=a.get("unfreeze_from_layer", -1),
+    ).to(device)
+    sd = ck["model"]
+    if any(k.startswith("module.") for k in sd):
+        sd = {k.replace("module.", ""): v for k, v in sd.items()}
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    # base.* keys are expected to be missing — they're loaded from HF.
+    # _layers/_embed/_final_norm/_lm_head/_rotary are ALIASES of base.* submodules
+    # (same tensors registered under a second name); loading base.* fills them,
+    # so listing them as "missing" is a false alarm.
+    real_missing = [k for k in missing
+                    if not k.startswith(("base.", "_layers.", "_embed.",
+                                         "_final_norm.", "_lm_head.", "_rotary."))]
+    if real_missing:
+        print(f"[GRAFT] WARNING missing trainable keys: {real_missing[:5]}")
+    if unexpected:
+        print(f"[GRAFT] WARNING unexpected keys: {unexpected[:5]}")
+    model.eval()
+    return model
+
+
 def make_depth_grid(arg_depth_grid: Optional[List[float]], arg_depth: Optional[float]) -> List[Optional[float]]:
     if arg_depth_grid:
         return [max(0.0, min(1.0, d)) for d in arg_depth_grid]
@@ -412,10 +447,13 @@ def make_depth_grid(arg_depth_grid: Optional[List[float]], arg_depth: Optional[f
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rft_ckpt", type=str, default=None,
-                    help="Path to an RFT-LM checkpoint. Mutually exclusive with --mt_ckpt.")
+                    help="Path to an RFT-LM checkpoint.")
     ap.add_argument("--mt_ckpt", type=str, default=None,
-                    help="Path to an MT-LM (Memorizing Transformers) checkpoint. "
-                         "Mutually exclusive with --rft_ckpt.")
+                    help="Path to an MT-LM (Memorizing Transformers) checkpoint.")
+    ap.add_argument("--graft_ckpt", type=str, default=None,
+                    help="Path to an RFTGraftLM checkpoint (operator on HF base).")
+    ap.add_argument("--graft_base", type=str, default=None,
+                    help="Override the HF base model name stored in the graft checkpoint.")
     ap.add_argument("--baseline_ckpt", type=str, default=None,
                     help="Optional baseline checkpoint to evaluate alongside the primary model.")
     ap.add_argument("--tokenizer_path", type=str, required=True)
@@ -444,11 +482,15 @@ def main():
     ap.add_argument("--outfile", type=str, default="niah_results.json")
     args = ap.parse_args()
 
-    if (args.rft_ckpt is None) == (args.mt_ckpt is None):
-        ap.error("Exactly one of --rft_ckpt or --mt_ckpt must be provided.")
-    primary_kind = "rft" if args.rft_ckpt is not None else "mt"
-    primary_ckpt = args.rft_ckpt if primary_kind == "rft" else args.mt_ckpt
-    primary_label = "RFT-LM" if primary_kind == "rft" else "MT-LM"
+    candidates = [
+        ("rft", args.rft_ckpt, "RFT-LM"),
+        ("mt", args.mt_ckpt, "MT-LM"),
+        ("graft", args.graft_ckpt, "RFT-Graft"),
+    ]
+    provided = [(k, c, l) for k, c, l in candidates if c is not None]
+    if len(provided) != 1:
+        ap.error("Exactly one of --rft_ckpt / --mt_ckpt / --graft_ckpt must be provided.")
+    primary_kind, primary_ckpt, primary_label = provided[0]
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -479,8 +521,12 @@ def main():
         if primary_kind == "rft":
             primary = load_rft_model(primary_ckpt, device)
             maybe_apply_rft_ablation(primary, args.rft_ablation)
-        else:
+        elif primary_kind == "mt":
             primary = load_mt_model(primary_ckpt, device)
+        elif primary_kind == "graft":
+            primary = load_graft_model(primary_ckpt, device, base_override=args.graft_base)
+        else:
+            raise ValueError(f"Unknown primary_kind={primary_kind}")
 
         baseline = None
         if args.baseline_ckpt is not None:

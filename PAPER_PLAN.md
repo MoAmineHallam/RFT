@@ -1,151 +1,181 @@
-# Paper Plan — "Small Models, Long Memory" (April 11, 2026)
+# Paper Plan v2 — "Retrieval Is Not Enough" (July 11, 2026)
+
+Supersedes the April 11 plan. The story pivots from "Small Models, Long Memory"
+to the **memory-to-output gap**: memory-augmented LMs can retrieve perfectly
+(recall@M = 1.0) and still answer at 0%. We name the gap, diagnose it, and
+present the training recipe that closes it.
 
 ## Working title
 
-> **Small Models, Long Memory: Training-Time Alignment Unlocks Long-Context Retrieval at 125M**
+> **Retrieval Is Not Enough: Closing the Memory-to-Output Gap in
+> Memory-Augmented Language Models**
 
-## Three-claim narrative (the pivoted paper)
+## The story (three claims)
 
-1. **Training technique (novel)**: Embedding alignment loss — train the
-   post-transform memory vector at the query position to match the target
-   token's tied output embedding via cosine + CE. Fixes the memory-to-output
-   decoding gap that blocks small memory-augmented transformers.
-2. **Long-context empirical result (headline)**: 125M model, trained at 2K,
-   reaches **96-97% on RULER S-NIAH at 8K** (base: 0%). Length generalizes
-   from 2K → 4× training length with no quality cliff.
-3. **Plug-and-play (breadth)**: The loss is architecture-agnostic. It
-   improves a Memorizing-Transformers-style kNN memory and a Neurocache-style
-   compressed memory without changing their architectures.
+1. **Diagnosis (novel framing)**: Retrieval quality and answer accuracy are
+   systematically decoupled in memory-augmented LMs. We show recall@M = 1.000
+   with 0% answer accuracy across architectures and scales. Prior work
+   conflates the two.
+2. **Fix (the technique)**: Embedding-alignment loss on the **post-transform**
+   memory context (`mem_ctx`, after gate → LN → out_proj → tanh(α)) + memory
+   gate initialized at 1.0. Gradient threads through the full memory pipeline
+   so tied embeddings can decode retrieved memories.
+   - Built-in mechanistic ablation cascade (already run): raw-`mem_v`
+     alignment → emb_acc 1.0 but 0% eval (proxy solved, task not);
+     post-transform alignment → +11–14pp (v4b→v5); gate 1.0 + longer
+     training → 96%+ (v6).
+3. **Headline**: 125M model trained at 2K reaches **~91% mean RULER S-NIAH
+   across the full 2K–8K × depth grid** (89–98% per cell) vs **0% base** and
+   **0–2% memory-disabled**. Length generalizes 4× beyond training length.
 
-## Positioning vs the 2025-2026 field
+**Stretch claim (decided by Gate G0)**: the recipe transfers to a pretrained
+LM — graft the memory operator onto frozen Qwen2.5-0.5B, unfreeze the tail,
+and unlock retrieval the vanilla model cannot do.
 
-| Work | Their slot | How we avoid collision |
-|---|---|---|
-| **Titans + MIRAS** (Google 2025) | surprise-gated memory, 2M context | out-of-reach on scale — cite, do not compete |
-| **HMT** (NAACL 2025) | hierarchical memory, "small beats big" | orthogonal axis: training loss, not architecture |
-| **Memorizing Transformers** (ICLR 2022) | kNN over (k,v) cache | **use as baseline** + apply alignment loss |
-| **Neurocache** (NAACL 2024) | compressed-state kNN | **use as baseline** + apply alignment loss |
-| **NAMM** (ICLR 2025, Sakana) | evolved memory management | orthogonal — different problem |
+**Honest negative (credibility section)**: OCR disambiguation gives +4.8% on
+513 synthetic experiments but is neutral on natural language even at M=256.
 
-We own: **"training-time fix that works across memory-augmented architectures at small scale."** Nobody else is in this cell.
+### Claim-scoping caveat (resolve BEFORE writing the abstract)
 
-## What I have ✅
+The graft currently trains with `decode_w=0` (alignment loss removed) because
+alignment recreated the proxy-solved pathology on a pretrained decode pathway.
+Two possible worlds — both publishable, different abstracts:
 
-- RFT-LM architecture: 125M GPT-2 + sliding window + FIFO memory bank + top-M router + `mem_gate_alpha` gate
-- **Embedding alignment loss** (post-transform `mem_ctx` → tied embedding)
-- v6 recipe: gate_alpha=1.0, 40 epochs, decode_w=10.0
-- v6 RULER S-NIAH headline (post tail-fix): **full grid 89-98% mean ~91%, base flat 0%**
-- v6 ablations: no-memory = 0%, memory is sole differentiator
-- **Gate 1B ✅ PASSED** — tail-chunk eval fix (K=8, inference-time only, no retrain).
-  Full RULER S-NIAH grid after fix (baseline flat 0% everywhere):
+- **World A** — graft works without alignment: scope the claim as *"alignment
+  is the unlock when the decode pathway is trained from scratch; a pretrained
+  pathway needs only end-to-end CE."* This is itself a finding about where
+  the gap lives.
+- **World B** — graft needs alignment re-added after CE warms up: the
+  universal "alignment closes the gap" claim holds everywhere.
 
-  | L | d=0.00 | d=0.25 | d=0.50 | d=0.75 | d=1.00 | mean |
-  |---|---|---|---|---|---|---|
-  | 2048 | 97 | 96 | 97 | 75 | 98 | 92.6 |
-  | 4096 | 92 | 94 | 96 | 73 | 98 | 90.6 |
-  | 8192 | 92 | 92 | 94 | 74 | 95 | 89.4 |
+Run the graft both ways (±alignment) once the smoke test passes, so the paper
+can state which world we are in with evidence.
 
-  d=1.0 went from 0 → 95-98%. Only remaining soft cell: d=0.75 at ~73-75%
-  (real model weakness, not a bug). Accept for first submission.
-- `--mem_gate_alpha_init` CLI override
-- Paper framing locked as Option B (training technique, not architecture)
+## What we have ✅
 
-## What to DROP (ruthless)
-
-| Drop | Why |
+| Asset | Status |
 |---|---|
-| OCR head + OCR losses + OCR ablations | Confirmed neutral on NL even at M=256. One honest-negative line in appendix, that's it. |
-| Mixed-objective synthetic curriculum as headline | Keep as appendix ablation. It's noise to the main story. |
-| 760M stretch run | Not needed for the pivoted framing. |
-| Titans / Infini-attention reimplementation | Never worth the weeks of engineering. |
-| LongBench full suite | 125M won't have signal on QA/summarization. |
-| Any new architectural variant | The architecture is NOT the contribution. Stop tweaking it. |
+| v6 RULER S-NIAH full grid (post tail-fix): 2K 92.6 / 4K 90.6 / 8K 89.4 mean; base 0%; no-memory 0–2% | ✅ in hand |
+| v6b (M=256) quasi-replicate — ties v6 | ✅ in hand |
+| v4b→v5→v6 ablation cascade (the bug history as mechanism evidence) | ✅ in hand |
+| 513-exp synthetic OCR study (+4.8%, honest negative on NL) | ✅ in hand |
+| Tail-chunk fix (Gate 1B): d=1.0 0% → 95–98%, inference-only | ✅ done |
+| Graft pipeline on Qwen2.5-0.5B (causal mask, forward_manual, eval wiring) | ✅ built, ⚠ unverified fix pushed |
+| MT kNN baseline code + eval wiring | ✅ code done; **run status unknown** |
+| Multi-seed v6 scripts (seeds 43, 44) | ✅ scripts; **run status unknown** |
+| aggregate_results.py → LaTeX tables | ✅ built |
 
-## What to ADD
+## Decision gates
 
-| Add | Why | Criticality |
-|---|---|---|
-| **Memorizing Transformers kNN memory (reimplemented cleanly)** + train with/without alignment loss at 125M | **This IS the paper.** Without this head-to-head you have no plug-in claim. | ★★★ |
-| **Neurocache-style compressed kNN** + alignment loss (optional, if time) | Strengthens the plug-in claim from 1 → 2 architectures | ★★ |
-| Multi-seed v6 (3 seeds, reduced variant set) | CI rigor | ★★ |
-| 350M scale point (single seed) for v6 AND for Memorizing-Transformers+alignment | Addresses scale objection | ★★★ |
-| Passkey + multi-needle RULER eval | Benchmark breadth (cheap) | ★ |
-| Tail-chunk eval fix run on v6 | Closes d=1.0 limitation | ★★ |
-| NarrativeQA + PassageRetrieval (LongBench subset) | One "real" benchmark, cheap | ★ |
-| Diagnostic figures (mem_gate_alpha trajectory, cosine-to-embed, per-depth) | Reviewer catnip | ★ |
-
-## Gated plan — V100 first, L40S only after 1A + 1C pass
-
-| Gate | Experiment | Where | Cost | Pass criterion | On failure |
+| Gate | What | Cost | Pass criterion | On pass | On fail |
 |---|---|---|---|---|---|
-| **1A** | **Memorizing Transformers kNN baseline @ 125M, with and without alignment loss** | V100 | ~2-3 days | alignment loss lifts kNN by ≥20pp at d=0.0-0.5 | Contribution is not plug-in → reframe as architecture-specific |
-| **1B** ✅ | Tail-chunk eval fix on v6 — **DONE, K=8, d=1.0 → 95-98%, mean ~91% across full grid** | V100 | ~2 hours | d=1.0 → ≥50% with K-sweep | — |
-| **1C** | Multi-seed v6 @ 125M (3 seeds × 2 variants: full, −embed_align) | V100 | ~3 GPU-days parallel | σ < 5pp across seeds | Harden recipe |
-| **1D** | Passkey + multi-needle RULER eval of v6 (no retrain) | V100 | ~6 hrs | ≥80% on new prompts | Retrain with mixed prompts |
-| **1E** | (optional) Neurocache-style compressed kNN baseline | V100 | ~3 days | alignment loss also helps it | Drop, single-baseline plug-in claim |
-| **2F** | **350M v6 + 350M kNN+alignment, single seed each** | **L40S** | ~2 days | Same pattern as 125M | Contribution is scale-dependent |
-| **2G** | 350M multi-seed (2-3 seeds) | **L40S** | ~4-5 days | σ < 5pp | Keep single-seed 350M, note in limitations |
-| **2H** | 16K-32K context eval @ 350M | **L40S** | ~12 hrs | ≥70% at 32K | Cap claims at 8K |
-| **3** | NarrativeQA + PassageRetrieval, diagnostic figures, paper draft | mixed | 1-2 wks | — | — |
+| **G0** | Graft smoke test (`bash run_graft_smoke.sh`, fix already pushed: decode_w=0, digit2, 1 needle) | 30 min | `niah_lm_full_match > 0.10` by step 1000 | Graft is IN → target EMNLP main | Debug ≤2 weeks, then cut graft → Findings/COLM story |
+| **G1** | Locate Gate 1A (MT ± alignment) checkpoints/evals on the training server | 10 min of looking | Runs finished | Eval + aggregate | Re-run: ~2–3 days on V100 |
+| **G2** | Locate seed-43/44 v6 checkpoints on the training server | 10 min | Runs finished | Eval + aggregate | Re-run: ~3 GPU-days |
+| **G3** | Graft full run (`run_graft_full.sh`, 8000 steps) + eval grid vs vanilla Qwen | ~1 day GPU | Graft beats vanilla Qwen by ≥30pp on 2–4K NIAH | Stretch section locked | Report smoke-only or cut |
 
-**Rule**: do not touch L40S until **1A + 1C** pass. 1A proves the plug-in
-claim (the whole paper hinges on it). 1C proves the headline is not a
-single-seed artifact.
+**Rule**: G0 first — it decides both the venue target and the abstract wording.
+G1/G2 are pure status checks on the server; do them the same day.
 
-## Baselines for the paper (final)
+## Experiment checklist (ordered by blocking severity)
 
-| Baseline | Role |
-|---|---|
-| Sliding-window-only (125M, window=512, no memory) | Floor (~0%) |
-| **Memorizing Transformers kNN (reimplemented, 125M)** | **Key head-to-head baseline** |
-| **Memorizing Transformers kNN + alignment loss** | **The plug-in claim** |
-| (optional) Neurocache-style compressed kNN, ± alignment loss | Second plug-in data point |
-| RFT-LM v6 (our full model) | The headline number |
-| RFT-LM v6 − embed_align (ablation) | Proves the loss is the unlock |
-| Full-attention oracle @ 8K | Upper bound reference |
+### Must-have — paper blocks without these
 
-## What gets split across V100 and L40S
+1. **[G0] Graft smoke test** — pull branch, `bash run_graft_smoke.sh`.
+2. **[G1] MT kNN ± alignment @ 125M** — THE plug-in/generality evidence.
+   Check server for April runs; re-run if missing. Without it, the
+   contribution shrinks to one architecture.
+3. **[G2] Multi-seed v6** (seeds 42/43/44) — eval + `aggregate_results.py`
+   for mean±std / Wilson CIs. Single-seed headline will not survive review
+   (v6b is a partial replicate, not a seed).
+4. **v6-config minus alignment loss, 1 seed** (~1 day) — v5→v6 changed three
+   things at once (gate init, epochs, decode_w). One controlled run under the
+   final recipe isolates the loss as the unlock. Reviewers will demand
+   exactly this ablation.
 
-**V100 (your current server, 2× 32GB)** — all of Phase 1:
-- All 125M experiments
-- All baseline reimplementations
-- All multi-seed work
-- Tail-chunk fix
-- Benchmark breadth evals
-- Diagnostic figures
+### Should-have — cheap, large credibility gain
 
-**L40S (your other server, 2× 46GB)** — only Phase 2, only after gates pass:
-- 350M training runs (v6 and kNN+alignment)
-- 350M multi-seed (if budget allows)
-- Long-context eval at 16K-32K
-- Nothing else
+5. **Multi-needle + passkey eval** (no retrain; `mk_num_keys ≥ 2` already
+   supported in `eval_ruler_niah.py`) — hours.
+6. **Perplexity sanity on v6** (`eval_perplexity.py`) — memory training does
+   not degrade LM quality — hours.
+7. **[G3] Graft full training + eval grid + vanilla Qwen baseline**
+   (scripts exist: `run_graft_full.sh`, `run_graft_eval_full.sh`) — if G0
+   passes. Include the ±alignment variant (World A/B experiment).
 
-The V100s handle everything that doesn't strictly require the bigger VRAM
-or faster throughput. The L40S handles only scale — one concern, one
-hardware commitment.
+### Nice-to-have — only if time remains before the deadline
 
-## Venue targets (after full pivot + gates pass)
+8. One non-synthetic data point (LongBench PassageRetrieval subset) —
+   answers "is this only NIAH?".
+9. Diagnostic figures: lm_acc / emb_acc / r@M training curves from
+   `train_metrics.jsonl` (the r@M=1.0-while-lm_acc=0 plot IS the paper's
+   Figure 1 motivation panel).
 
-| Venue | Est. | Comment |
+## What to DROP (unchanged from v1, still ruthless)
+
+- OCR as a contribution (honest-negative subsection only)
+- 350M/760M scale runs — the graft on Qwen-0.5B replaces the scale story
+- Titans/Infini-attention reimplementation
+- Full LongBench suite
+- Any new architectural variant
+
+## Paper skeleton
+
+1. **Intro** — Figure 1: (a) training curves showing recall@M=1.0 while
+   answer acc=0 (the gap, visually); (b) headline bar: base 0% → ours 91%.
+2. **The memory-to-output gap** — definition, where it comes from (signal
+   attenuation ×~0.1 gate, layer-6-space vs layer-12-space representation
+   mismatch), evidence it is systematic.
+3. **Method** — memory bank + router (brief, not the contribution);
+   alignment loss on post-transform mem_ctx; gate init; training curriculum.
+4. **Experiments A: from-scratch 125M** — full grid table (multi-seed CIs),
+   ablations (no-memory, no-alignment, raw-vs-post-transform alignment,
+   gate init), length generalization.
+5. **Experiments B: plug-in generality** — MT kNN ± alignment head-to-head.
+6. **Experiments C (stretch): pretrained graft** — Qwen2.5-0.5B graft vs
+   vanilla, ±alignment (World A/B result).
+7. **Honest negative** — OCR: synthetic +4.8%, NL neutral at M=64 and M=256.
+8. **Limitations** — d=0.75 soft cell (~73–75%), synthetic-task focus,
+   ≤0.5B scale, write-after-read handled by inference-time tail-chunking.
+
+## Venue strategy
+
+| Outcome | Target | Est. |
 |---|---|---|
-| NeurIPS/ICML/ICLR main | **40-50%** | Plug-in training-time claim is a strong angle |
-| EMNLP/ACL main | 40-50% | NL retrieval framing fits |
-| **COLM** | **55-65%** | Best venue/effort ratio |
-| NeurIPS/ICML workshop | 75-85% | Essentially in the bag |
+| G0+G3 pass (graft works) | **EMNLP 2026 main (CCF B)** | 40–50% |
+| G0 fails, rest solid | EMNLP Findings | 50–60% |
+| Either | COLM (not CCF-ranked, well regarded) as backup | 55–65% |
 
-## Next 2 weeks — V100 only
+**Action items (non-experiment):**
+- Confirm the exact ARR cycle deadline for EMNLP 2026 — today is July 11;
+  the cycle determines whether G3 makes the submission or the camera-ready.
+- **Ask Prof. Zeng whether EMNLP Findings counts as CCF B under HIT's degree
+  policy.** If it does not, EMNLP main is the real target and G0/G3 are
+  mandatory, not stretch.
+
+## Two-week schedule (from July 11)
 
 **Week 1**
-- Day 1: run tail-chunk eval fix on v6 (Gate 1B) — ~2 hours, decides d=1.0
-- Day 1-3: implement clean Memorizing Transformers kNN baseline (no OCR, no alignment loss)
-- Day 4-6: train Memorizing Transformers baseline + variant with alignment loss (Gate 1A) — 2 runs on 2 GPUs
-- Day 3-6 (parallel): multi-seed v6 full variant, seed 43 + seed 44 (Gate 1C) — 2 runs on 2 GPUs after Day 1-3 code work
-- Day 7: add multi-needle + passkey to eval script; eval v6 (Gate 1D)
+- Day 1: **G0** graft smoke (30 min) + **G1/G2** server status check (30 min).
+  Report results back → plan locks.
+- Day 1–3: whatever G1/G2 found missing goes on the GPUs
+  (MT ± alignment and/or seeds 43/44 — they parallelize across 2 GPUs).
+- Day 2–3 (CPU/eval GPU): multi-needle + passkey evals, perplexity sanity.
+- Day 3–5: v6-minus-alignment controlled run (item 4).
+- Day 4–7 (if G0 passed): graft full run + ±alignment variant (G3).
 
 **Week 2**
-- Day 8-10: eval all Week 1 checkpoints, aggregate tables, compute CIs
-- Day 11-12: write paper skeleton (title, intro, headline figure, ablation table)
-- **Day 13-14: DECISION POINT.** If 1A passes (alignment loss lifts kNN ≥20pp) and 1C passes (σ < 5pp) → commit to L40S for Phase 2.
+- Day 8–9: eval everything, `aggregate_results.py`, CIs, all tables.
+- Day 10: G3 eval grid + vanilla Qwen baseline → decide main vs Findings.
+- Day 11–14: paper skeleton → full draft (title, abstract per World A/B,
+  Figure 1, grid table, ablation table, honest-negative section).
 
-**Everything else** (Neurocache baseline, LongBench subset, diagnostic figures)
-fits in the L40S-training wait periods of Phase 2.
+## Immediate next actions (do these today)
+
+1. `git pull` on the training server, `bash run_graft_smoke.sh` → paste the
+   log (G0).
+2. Look for these on the server and report what exists (G1/G2):
+   - MT baseline checkpoints/evals (Gate 1A runs from April)
+   - `mixed_pilot_v6_seed43*` / `seed44*` checkpoints
+3. Ask Prof. Zeng: does Findings count as CCF B for the degree?
+4. Look up the ARR deadline for the EMNLP 2026 cycle.
